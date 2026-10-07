@@ -193,14 +193,19 @@ v0.2.24 根据 #74 的反馈，增加仅供版本检查使用的 `YYB_UPDATE_PRO
 项目基于 [SuperNaiBA/YYB_GO](https://github.com/SuperNaiBA/YYB_GO) 整理和增强。使用和分发时请同时遵守上游授权条件、目标平台规则及所在地法律法规。
 
 
-for own use！！！仅供参考 其他系统未测试(因为不会)
-1.在飞牛系统中，直接yyb创建文件夹
-复制整个部署的compose之yaml里面有两个改动的点：1端口所有的8000改成未被占用的端口，2末尾的networks:
+##for own use！！！仅供参考 其他系统未测试(因为不会)
+
+-1.在飞牛系统中，直接yyb创建文件夹
+复制整个部署的compose之yaml里面有两个改动的点：1端口所有的8000改成未被占用的端口，2末尾的
+```
+networks:
   qinglong:
     external: true
-    name: ${YYB_DOCKER_NETWORK:-qinglong} 这里青龙就是你青龙的容器名，docker ps 查看
-2.ssh工具里执行docker network create qinglong创建网络，docker network connect qinglong qinglong(最后一个青龙就是容器名)
-3.飞牛系统里面有一个权限问题：cd到刚才compose的目录，执行 mkdir -p data/db data/avatars data/qr
+    name: ${YYB_DOCKER_NETWORK:-qinglong}
+```这里青龙就是你青龙的容器名，docker ps 查看
+-2.ssh工具里执行docker network create qinglong创建网络，docker network connect qinglong qinglong(最后一个青龙就是容器名)
+-3.飞牛系统里面有一个权限问题：cd到刚才compose的目录，执行```
+ mkdir -p data/db data/avatars data/qr
 chmod -R 777 data
-
+```
 
