@@ -1,5 +1,7 @@
 package httpapi
 
+import "strings"
+
 func wxAliasOperation(summary, requestSchema, responseSchema string) map[string]any {
 	return map[string]any{
 		"post": openAPIOperation(
@@ -11,11 +13,11 @@ func wxAliasOperation(summary, requestSchema, responseSchema string) map[string]
 }
 
 func newOpenAPISpec() map[string]any {
-	return map[string]any{
+	spec := map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
 			"title":       "YYB Go 接口文档",
-			"description": "用于微信扫码登录、账号管理和 wxapp 接口调用的 API。",
+			"description": "用于微信扫码登录、账号管理和 wxapp 接口调用的 API。配置 YYB_PROTOCOL_TOKEN 时，点击 Authorize 填入令牌（不含 Bearer 前缀）；仅协议接口携带该请求头。未配置时可留空。管理接口仍需网页登录。",
 			"version":     "1.0.0",
 		},
 		"servers": []map[string]any{
@@ -481,6 +483,13 @@ func newOpenAPISpec() map[string]any {
 			},
 		},
 		"components": map[string]any{
+			"securitySchemes": map[string]any{
+				"ProtocolBearer": map[string]any{
+					"type":        "http",
+					"scheme":      "bearer",
+					"description": "填写 YYB_PROTOCOL_TOKEN 的值，不含 Bearer 前缀。未配置时留空。只用于 /wx/* 与 /wxapp/*，不会代替网页登录。",
+				},
+			},
 			"schemas": map[string]any{
 				"APIResponse": objectSchema([]string{"code", "msg", "data"}, map[string]any{
 					"code": map[string]any{"type": "integer", "example": 0, "description": "业务状态码，0 表示成功，非 0 表示业务错误。"},
@@ -560,6 +569,7 @@ func newOpenAPISpec() map[string]any {
 					"remark": map[string]any{"type": "string", "maxLength": 80},
 				}),
 				"ProxySpec": objectSchema(nil, map[string]any{
+					"protocol_proxy_mode":   map[string]any{"type": "string", "enum": []string{"account", "direct"}, "description": "新账号小程序调用出口，默认跟随账号连接模式；已有账号重扫保留原设置。"},
 					"product":               map[string]any{"type": "string", "enum": []string{"appstore"}, "default": "appstore", "description": "登录产品。电脑管家等产品在凭据兑换链路验证前不会创建会话。"},
 					"mode":                  map[string]any{"type": "string", "enum": []string{"direct", "static", "api"}, "default": "direct"},
 					"proxy_type":            map[string]any{"type": "string", "enum": []string{"http", "socks5"}, "default": "http", "description": "http 使用 HTTP CONNECT。"},
@@ -572,6 +582,7 @@ func newOpenAPISpec() map[string]any {
 					"refresh_ahead_minutes": map[string]any{"type": "integer", "minimum": 5, "maximum": 90, "default": 5},
 				}),
 				"AccountProxyRequest": objectSchema([]string{"ref", "mode"}, map[string]any{
+					"protocol_proxy_mode":   map[string]any{"type": "string", "enum": []string{"account", "direct"}, "description": "小程序调用出口；省略或 null 保留原值，新账号默认 account。扫码与凭据刷新仍遵循账号代理。"},
 					"ref":                   map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},
 					"mode":                  map[string]any{"type": "string", "enum": []string{"direct", "static", "api"}},
 					"proxy_type":            map[string]any{"type": "string", "enum": []string{"http", "socks5"}},
@@ -596,6 +607,7 @@ func newOpenAPISpec() map[string]any {
 					"refresh_ahead_minutes": map[string]any{"type": "integer", "minimum": 5, "maximum": 90, "default": 5},
 				}),
 				"AccountProxySetting": objectSchema([]string{"account_id", "mode", "proxy_type", "configured", "updated_at"}, map[string]any{
+					"protocol_proxy_mode":   map[string]any{"type": "string", "enum": []string{"account", "direct"}, "description": "小程序调用跟随账号连接模式或直接连接微信。"},
 					"account_id":            int64Schema(),
 					"mode":                  map[string]any{"type": "string", "enum": []string{"direct", "static", "api"}},
 					"proxy_type":            map[string]any{"type": "string", "enum": []string{"http", "socks5"}},
@@ -780,6 +792,19 @@ func newOpenAPISpec() map[string]any {
 			},
 		},
 	}
+	// Scope Swagger's Authorization header to the same protocol endpoints as
+	// the router gate, without leaking it to management or public operations.
+	for path, item := range spec["paths"].(map[string]any) {
+		if !strings.HasPrefix(path, "/wx/") && !strings.HasPrefix(path, "/wxapp/") {
+			continue
+		}
+		for _, value := range item.(map[string]any) {
+			operation := value.(map[string]any)
+			operation["security"] = []map[string][]string{{"ProtocolBearer": {}}}
+			operation["responses"].(map[string]any)["401"] = jsonErrorResponse("协议令牌缺失或错误。")
+		}
+	}
+	return spec
 }
 
 func openAPIOperation(tags []string, summary string, parameters []map[string]any, requestBody map[string]any, responses map[string]any) map[string]any {

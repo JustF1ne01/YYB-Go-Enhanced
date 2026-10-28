@@ -193,23 +193,12 @@ func NewApp(cfg Config) (*App, error) {
 		proxyLeaseLocks:    map[int64]chan struct{}{},
 		keepAliveRetryAt:   map[int64]time.Time{},
 	}
-	authDriver := strings.ToLower(strings.TrimSpace(cfg.AuthDriver))
-	authDSN := strings.TrimSpace(cfg.AuthDSN)
-	if authDriver == "" && cfg.AuthMySQLDSN != "" {
-		authDriver = "mysql"
-		authDSN = cfg.AuthMySQLDSN
+	authDriver, authDSN, err := cfg.AuthDatabase()
+	if err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	if authDriver != "" && authDriver != "none" {
-		if authDriver == "mysql" && authDSN == "" {
-			authDSN = cfg.AuthMySQLDSN
-		}
-		if authDriver == "sqlite" && authDSN == "" {
-			authDSN = filepath.Join(res.DB, "auth.db")
-		}
-		if authDSN == "" {
-			_ = db.Close()
-			return nil, fmt.Errorf("auth %s DSN is empty", authDriver)
-		}
 		authCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		authStore, authErr := auth.Open(authCtx, authDriver, authDSN)
@@ -274,22 +263,30 @@ func (a *App) Handler() http.Handler {
 		c.Next()
 	})
 	router.StaticFS("/static", http.Dir(a.resources.Static))
-	// Existing automation clients must remain independent from browser sessions.
-	router.Any("/wx/oauth", gin.WrapF(a.handlePublicOAuth))
-	router.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
-	router.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
-	router.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
-	router.Any("/wx/code", gin.WrapF(a.handleWXCodeAlias))
-	router.Any("/wx/getuserinfo", gin.WrapF(a.handleWXGetUserInfo))
-	router.Any("/wx/encryptkey", gin.WrapF(a.handleWXEncryptKey))
-	router.Any("/wx/getlatestuserkey", gin.WrapF(a.handleWXLatestUserKey))
-	router.Any("/wx/getphonenumber", gin.WrapF(a.handleWXPhoneAlias))
-	router.Any("/wx/cloud", gin.WrapF(a.handleWXCloud))
-	router.Any("/wx/qrcodeauth", gin.WrapF(a.handleQRRoot))
-	router.Any("/wx/qrcodeauth/*path", gin.WrapF(a.handleQR))
-	router.Any("/wx/mpgeta8key", gin.WrapF(a.handleWXMPGetA8Key))
-	router.Any("/wx/appmsgext", gin.WrapF(a.handleWXAppMsgExt))
-	router.Any("/wx/appmsglike", gin.WrapF(a.handleWXAppMsgLike))
+	// Automation stays independent from browser sessions, but every protocol
+	// route (including QR subpaths) must pass the configured token gate first.
+	protocolRoutes := router.Group("", func(c *gin.Context) {
+		if !a.authorizeProtocol(c.Writer, c.Request) {
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
+	protocolRoutes.Any("/wx/oauth", gin.WrapF(a.handlePublicOAuth))
+	protocolRoutes.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
+	protocolRoutes.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
+	protocolRoutes.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+	protocolRoutes.Any("/wx/code", gin.WrapF(a.handleWXCodeAlias))
+	protocolRoutes.Any("/wx/getuserinfo", gin.WrapF(a.handleWXGetUserInfo))
+	protocolRoutes.Any("/wx/encryptkey", gin.WrapF(a.handleWXEncryptKey))
+	protocolRoutes.Any("/wx/getlatestuserkey", gin.WrapF(a.handleWXLatestUserKey))
+	protocolRoutes.Any("/wx/getphonenumber", gin.WrapF(a.handleWXPhoneAlias))
+	protocolRoutes.Any("/wx/cloud", gin.WrapF(a.handleWXCloud))
+	protocolRoutes.Any("/wx/qrcodeauth", gin.WrapF(a.handleQRRoot))
+	protocolRoutes.Any("/wx/qrcodeauth/*path", gin.WrapF(a.handleQR))
+	protocolRoutes.Any("/wx/mpgeta8key", gin.WrapF(a.handleWXMPGetA8Key))
+	protocolRoutes.Any("/wx/appmsgext", gin.WrapF(a.handleWXAppMsgExt))
+	protocolRoutes.Any("/wx/appmsglike", gin.WrapF(a.handleWXAppMsgLike))
 	router.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
 	router.GET("/integration/module-manifest.json", gin.WrapF(a.handleIntegrationManifest))
 	router.GET("/integration/accounts", gin.WrapF(a.handleIntegrationAccounts))
@@ -1252,7 +1249,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if accountNeedsRescan(acc) {
 		return nil, accountExpiredError{openid: acc.OpenID}
 	}
-	proxyValue, fallbackDirect, err := a.resolveAccountProxy(ctx, acc.ID)
+	proxyValue, fallbackDirect, err := a.resolveWXAppProxy(ctx, acc.ID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve account proxy: %w", err)
 	}
@@ -1267,7 +1264,10 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		return nil, callErr
 	}
 	_ = a.db.InvalidateSession(ctx, acc.ID, proxyValue)
-	status, refreshErr := a.refreshLivenessWithProxy(ctx, acc, proxyValue, fallbackDirect)
+	// Credential recovery always uses the account's refresh route, even when
+	// this protocol call explicitly selected direct egress.
+	status, _, refreshErr := a.refreshAccount(ctx, acc, true)
+	status = a.finishLivenessRefresh(ctx, acc, status)
 	if status != "alive" {
 		if status == "expired" {
 			return nil, accountExpiredError{openid: acc.OpenID}

@@ -6,10 +6,13 @@
 QYWX_TOKEN = __import__("os").getenv("QYWX_TOKEN", "")  # 企业微信机器人 Webhook key（机器人地址 ?key= 后面的值，留空不推送）
 
 # ==========================================================
-# 功能说明：code 换 token（含缓存与自动刷新）
-# 机制：本地 code 服务获取微信 code → 换取 token → 缓存到本地 JSON；
-#       下次运行先读取缓存 token，并调用用户信息接口验证是否仍有效；
-#       有效则直接复用（无需再获取 code）；失效或过期则重新获取 code 自动刷新。
+# 登录适配（#98 提供小程序解包线索，2026-10-19）：
+#   wx.login code → POST /sso/login/minalogin {sourceChannel:"Mina", code}
+#                   → open_id / union_id / user_id（兼容顶层及 data 包裹）
+#   baselogin 不接收 code；它用 {sourceChannel:"Mina", login_type:"MemberCenter", UserId:<userid>}
+#   仅用于登录后的身份刷新（取用户信息）。
+#   无会员 user_id 时停止，不自动注册或绑定手机号；
+#   本地实测已到达身份响应，会员登录及签到仍待已绑定账号验证。
 # ==========================================================
 
 
@@ -17,11 +20,11 @@ QYWX_TOKEN = __import__("os").getenv("QYWX_TOKEN", "")  # 企业微信机器人 
 爱隐形小程序动态 code 版
 
 功能：
-  1. 本地 code 服务获取微信 code
-  2. /sso/login/baselogin 使用 code 换 userid
+  1. 本地 code 服务获取微信 code（YYB 兼容层 /wxapp/getCode）
+  2. /sso/login/minalogin 使用 code 换 open_id/user_id
   3. 每日签到（getsignlist 查询 + sign-in 提交）
   4. 查询金币资产
-  5. PushPlus 推送
+  5. PushPlus / 企业微信推送
   6. 品赞代理，业务请求优先代理，失败直连兜底
 
 环境变量：
@@ -36,8 +39,10 @@ QYWX_TOKEN = __import__("os").getenv("QYWX_TOKEN", "")  # 企业微信机器人 
   socks5 代理需：
   pip install requests[socks]
 
-⚠️ 登录接口为推断，未经真机验证，失败请抓包核对
-   （源脚本为 userid 抓包型，/sso/login/baselogin 的 code 参数位为推断）
+登录接口依据 #98 的解包线索改用 minalogin；本地真实响应为顶层身份字段。
+   未取得会员 user_id 的账号不能执行签到，不据此断言未注册或账号失效。
+   历史来源：https://github.com/3ixi/autoscripts/blob/bae528cb8d28ec751d86daea3bbd89a699b8ba2b/aiyx.py
+   （源脚本为 UserId 登录型，不含 minalogin code 链路）
 """
 
 
@@ -76,7 +81,12 @@ ENABLE_DIRECT_FALLBACK = True
 REQUEST_TIMEOUT = 30
 
 BASE_URL = "https://japi.yinxingyanjing.com"
-LOGIN_URL = f"{BASE_URL}/sso/login/baselogin"
+# 登录接口（#98 解包线索与本地实际身份响应）：
+#  - code 换身份：POST /sso/login/minalogin {sourceChannel:"Mina", code}
+#    → 顶层或 data 含 open_id / union_id / user_id
+#  - baselogin 不接收 code！它用 UserId/user_id（登录后的身份刷新/取用户信息），
+#    body = {sourceChannel:"Mina", login_type:"MemberCenter", UserId:<userid>}
+LOGIN_URL = f"{BASE_URL}/sso/login/minalogin"
 SIGN_LIST_URL = f"{BASE_URL}/user/sigouser/getsignlist"
 SIGN_IN_URL = f"{BASE_URL}/user/sigouser/sign-in"
 ASSET_URL = f"{BASE_URL}/user/user-info/getassetheaderinfo"
@@ -123,8 +133,47 @@ def to_float(value: Any) -> float:
 
 
 def safe_data(resp: Dict[str, Any]) -> Dict[str, Any]:
-    """Safely extract 'data' from an API response, handling null/missing."""
-    return resp.get("data") or {}
+    data = resp.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def business_succeeded(resp: Any) -> bool:
+    """兼容旧 error_code=0 和实测新格式；矛盾或缺失状态不视为成功。"""
+    if not isinstance(resp, dict):
+        return False
+    if "success" in resp and resp["success"] is not True:
+        return False
+    if "failed" in resp and resp["failed"] is not False:
+        return False
+    legacy = type(resp.get("error_code")) in (int, str) and resp["error_code"] in (0, "0")
+    modern = (
+        type(resp.get("code")) in (int, str) and resp["code"] in (1, "1")
+        and resp.get("success") is True and resp.get("failed") is False
+    )
+    if "error_code" in resp and not legacy:
+        return False
+    if "code" in resp and not modern:
+        return False
+    return legacy or modern
+
+
+def business_status_summary(resp: Dict[str, Any]) -> str:
+    """仅输出有限的状态字段，不回显业务消息、身份或原始响应。"""
+    fields = []
+    for key in ("error_code", "code", "success", "failed", "http_status"):
+        if key not in resp:
+            continue
+        value = resp[key]
+        if key in ("success", "failed") and type(value) is bool:
+            text = str(value).lower()
+        elif type(value) is int and abs(value) <= 10**10:
+            text = str(value)
+        elif type(value) is str and len(value) <= 10 and value.lstrip("-").isdigit():
+            text = value
+        else:
+            text = "空或异常"
+        fields.append(f"{key}={text}")
+    return ", ".join(fields) or "缺少业务状态字段"
 
 
 def log_title() -> None:
@@ -134,6 +183,7 @@ def log_title() -> None:
     print(f"║ 🕒 启动时间: {now_text():<32}║")
     print(f"║ 🔢 账号数量: {len(SERVERS):<34}║")
     print("╚" + "═" * 50 + "╝")
+    print("ℹ️ [适配状态] 登录使用 minalogin；需取得会员 user_id，不能仅凭 YYB 取码成功判断签到可用。")
 
 
 def log_account_header(index: int, total: int, server: str) -> None:
@@ -399,56 +449,78 @@ def extract_token(data: Any) -> str | None:
 
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
 
-    candidates = []
     for obj in (data, inner):
-        for key in ("UserId", "userId", "userid", "user_id", "id"):
+        for key in ("UserId", "userId", "userid", "user_id"):
             value = obj.get(key)
-            if value not in (None, "", "null", 0):
-                candidates.append(value)
-
-    for item in candidates:
-        if item:
-            return str(item)
+            if type(value) is int and value > 0:
+                return str(value)
+            if isinstance(value, str):
+                value = value.strip()
+                if value and value.lower() not in ("null", "none", "0"):
+                    return value
 
     return None
 
 
+def login_failure_message(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "minalogin 返回结构异常，未取得 user_id（不会输出原始登录响应）"
+    if data.get("error_msg") in ("用户不存在", "用户不存在或已注销"):
+        return (
+            "minalogin 业务拒绝：用户不存在/已注销；不能据此认定 YYB 失效、代理异常或参数完全正确。"
+            "请在官方小程序核对会员登录及绑定情况"
+        )
+    return "minalogin 业务拒绝，未取得会员 user_id；请核对业务状态与小程序登录情况（不回显原始登录响应）"
+
+
 def login_by_code(server: str, code: str, proxies: Dict[str, str] | None) -> Tuple[str | None, Dict[str, Any] | None]:
     try:
-        print("🔐 [登录] 使用 code 换 userid")
+        print("🔐 [登录] minalogin：使用 wx.login code 换 open_id/user_id")
         response = request_with_proxy(
             "POST",
             LOGIN_URL,
             headers=common_headers(),
             json={
                 "sourceChannel": "Mina",
-                "Code": code,
-                "login_type": "MemberCenter",
+                "code": code,
             },
             proxies=proxies,
             server=server,
         )
 
+        if not 200 <= response.status_code < 300:
+            data = {"error_msg": f"minalogin HTTP {response.status_code}，未取得 userid"}
+            print(f"❌ [登录] {data['error_msg']}")
+            return None, data
         try:
             data = response.json()
-        except Exception:
-            data = {"raw": response.text[:800]}
+        except ValueError:
+            data = None
 
-        # 照源脚本：error_code == 10001 表示登录成功
-        if data.get("error_code") != 10001:
-            print(f"❌ [登录] 登录失败: {data.get('error_msg') or json_preview(data)}")
-            return None, data
+        if not isinstance(data, dict):
+            message = "minalogin 返回结构异常（非 JSON），未取得 user_id"
+            print(f"❌ [登录] {message}")
+            return None, {"error_msg": message}
+
+        # 实测 minalogin 使用空 error_code；兼容 0/10001 或仅身份字段。
+        # 明确的失败码必须先处理，不能因错误响应夹带 user_id 就保存缓存。
+        if data.get("error_code") not in (None, "", 0, "0", 10001, "10001"):
+            message = login_failure_message(data)
+            print(f"❌ [登录] {message}")
+            return None, {"error_msg": message}
 
         userid = extract_token(data)
         if userid:
-            print(f"✅ [登录] userid 获取成功: {mask(userid)}")
+            print(f"✅ [登录] user_id 获取成功: {mask(userid)}")
             return userid, data
 
-        print(f"❌ [登录] 未识别 userid 字段: {json_preview(data)}")
-        return None, data
-    except Exception as exc:
-        print(f"❌ [登录] 请求异常: {exc}")
-        return None, None
+        message = "minalogin 未取得会员 user_id，不保存缓存或执行签到；请先在官方小程序核对会员登录/手机号绑定"
+        print(f"❌ [登录] {message}")
+        return None, {"error_msg": message}
+    except Exception:
+        message = "minalogin 请求异常，未取得 userid；请检查连接，不能据此判断账号失效"
+        print(f"❌ [登录] {message}")
+        return None, {"error_msg": message}
 
 
 def api_get(server: str, url: str, token: str, proxies: Dict[str, str] | None) -> Dict[str, Any]:
@@ -477,13 +549,15 @@ def api_post(server: str, url: str, token: str, proxies: Dict[str, str] | None, 
         proxies=proxies,
         server=server,
     )
+    if not 200 <= response.status_code < 300:
+        return {"error_code": -1, "http_status": response.status_code, "error_msg": f"商户接口 HTTP {response.status_code}"}
     try:
-        return response.json()
-    except Exception:
-        return {
-            "error_code": -1,
-            "error_msg": f"JSON解析失败: {response.text[:300]}",
-        }
+        data = response.json()
+    except ValueError:
+        return {"error_code": -1, "error_msg": "商户接口 JSON 解析失败（不输出原始响应）"}
+    if not isinstance(data, dict):
+        return {"error_code": -1, "error_msg": "商户接口响应结构异常"}
+    return data
 
 
 # ====================== Token缓存管理 ======================
@@ -533,12 +607,18 @@ def login_with_cache(server: str, proxies: Dict[str, str] | None) -> Tuple[str |
         print("🔍 [缓存] 验证 userid")
         try:
             asset_resp = api_post(server, ASSET_URL, cache_token, proxies, {"user_id": cache_token})
-            if not asset_resp.get("error_code"):
+            if business_succeeded(asset_resp) and safe_data(asset_resp).get("gold") is not None:
                 print("✅ [缓存] userid 有效")
                 return cache_token, None
-        except Exception as exc:
-            print(f"⚠️ [缓存] 验证异常: {exc}")
-        print("⚠️ [缓存] userid 已失效，重新登录")
+            if not isinstance(asset_resp, dict) or asset_resp.get("error_code") in (None, -1, "-1", 0, "0"):
+                message = "商户缓存校验响应异常，本轮停止登录；保留缓存，不把缺失状态码当作验证成功"
+                print(f"⚠️ [缓存] {message}")
+                return None, {"error_msg": message}
+        except Exception:
+            message = "商户缓存校验请求失败，本轮停止登录并保留缓存；请求异常不代表 userid 已失效"
+            print(f"⚠️ [缓存] {message}")
+            return None, {"error_msg": message}
+        print("⚠️ [缓存] 商户资产接口未接受缓存 userid，尝试 minalogin 重新登录")
 
     code = get_code(server)
     if not code:
@@ -590,7 +670,7 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
 
     token, raw_login = login_with_cache(server, proxies)
     if not token:
-        result["error"] = f"登录失败: {json_preview(raw_login)}"
+        result["error"] = (raw_login or {}).get("error_msg") or "未取得商户 userid，请核对 YYB 取码与商户登录两个阶段"
         return result
 
     result["token"] = mask(token)
@@ -607,17 +687,23 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
             proxies,
             {"sourcechannel": "Mina", "user_id": token},
         )
-        if sign_list_resp.get("error_code"):
-            result["error"] = f"获取签到列表失败: {sign_list_resp.get('error_msg')}"
+        if not business_succeeded(sign_list_resp):
+            result["error"] = f"获取签到列表失败（{business_status_summary(sign_list_resp)}），未确认业务成功状态"
             print(f"❌ [签到] {result['error']}")
             return result
 
-        today_info = safe_data(sign_list_resp).get("todaySignInfo") or {}
-        is_sign = today_info.get("isSign")
+        today_info = safe_data(sign_list_resp).get("todaySignInfo")
+        if not isinstance(today_info, dict):
+            today_info = {}
+        is_sign = str(today_info.get("isSign", ""))
         sign_msg = today_info.get("msg", "") or ""
-        print(f"📋 [签到] 今日{'已' if is_sign == 1 else '未'}签到 {sign_msg}".strip())
+        if is_sign not in ("0", "1"):
+            result["error"] = "签到列表缺少明确的今日状态，未提交签到，不能当作已签到"
+            print(f"❌ [签到] {result['error']}")
+            return result
+        print(f"📋 [签到] 今日{'已' if is_sign == '1' else '未'}签到 {sign_msg}".strip())
 
-        if is_sign == 0:
+        if is_sign == "0":
             wait_time = random.randint(2, 5)
             print(f"⏳ [签到] 提交前等待 {wait_time}s")
             sleep(wait_time)
@@ -629,24 +715,33 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
                 proxies,
                 {"user_id": token, "source_channel": "Mina"},
             )
-            if sign_resp.get("error_code"):
-                result["signMsg"] = f"签到执行失败: {sign_resp.get('error_msg')}"
+            if not business_succeeded(sign_resp):
+                result["signMsg"] = f"签到执行失败（{business_status_summary(sign_resp)}），未确认业务成功状态"
+                result["error"] = result["signMsg"]
                 print(f"❌ [签到] {result['signMsg']}")
-            else:
-                result["signMsg"] = f"签到成功 {sign_msg}".strip()
-                print(f"✅ [签到] {result['signMsg']}")
+                return result
+            verified = api_post(server, SIGN_LIST_URL, token, proxies, {"sourcechannel": "Mina", "user_id": token})
+            verified_today = safe_data(verified).get("todaySignInfo")
+            if not business_succeeded(verified) or not isinstance(verified_today, dict) or str(verified_today.get("isSign", "")) != "1":
+                result["error"] = "签到提交后未确认今日已签到，本轮不重复提交"
+                print(f"⚠️ [签到] {result['error']}")
+                return result
+            result["signMsg"] = f"签到成功（已复查） {sign_msg}".strip()
+            print(f"✅ [签到] {result['signMsg']}")
         else:
             result["signMsg"] = f"今日已签到 {sign_msg}".strip()
             print(f"✅ [签到] {result['signMsg']}")
 
         asset_resp = api_post(server, ASSET_URL, token, proxies, {"user_id": token})
-        if not asset_resp.get("error_code"):
-            gold = safe_data(asset_resp).get("gold", "未知")
+        if business_succeeded(asset_resp) and safe_data(asset_resp).get("gold") is not None:
+            gold = safe_data(asset_resp)["gold"]
             result["goldMsg"] = str(gold)
             print(f"💰 [金币] 当前总金币: {gold}")
         else:
-            result["goldMsg"] = f"获取失败: {asset_resp.get('error_msg')}"
+            result["goldMsg"] = f"获取失败：资产接口状态或金币字段未确认（{business_status_summary(asset_resp)}）"
+            result["error"] = result["goldMsg"]
             print(f"⚠️ [金币] {result['goldMsg']}")
+            return result
 
         result["success"] = True
         return result
@@ -725,6 +820,8 @@ def main() -> None:
     print("╚" + "═" * 50 + "╝")
 
     send_pushplus("👓 爱隐形任务完成", build_notify(results))
+    if fail_count:
+        raise SystemExit(1)
 
 
 # --- YYB compatibility layer (managed) ---

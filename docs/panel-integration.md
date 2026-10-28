@@ -48,6 +48,16 @@ env:query env:manage cron:query cron:manage cron:run file:list file:read
 
 扫码完成后可直接把账号合并到面板中的 `YYB_SERVER`。重复同步不会重复写入相同账号。
 
+### 重复变量处理
+
+v0.2.30 起，单账号、扫码自动同步和全量同步均更新原变量 ID，只有完全不存在 `YYB_SERVER` 时才新建。呆呆面板的昵称备注改变也不会新增一条变量；单条已禁用变量保持禁用，不会自动启用。
+
+若面板已有一条启用项及若干禁用历史项，同步以启用项为准，保留其他项。若存在多条启用项，或没有启用项但存在多条禁用项，同步会报错并停止写入。
+
+旧版本已经产生重复项时，先在面板核对各项的账号列表，把仍需使用的账号整理到一条 `YYB_SERVER`（每行 `地址@ID` 或 `地址@OpenID`），仅启用这一条，其余禁用；再回 YYB 执行全量同步。请不要直接把多条变量值用 `&` 拼回单条，也不要恢复已删除或失效的账号。手工添加的地址、账号及自定义备注不会被自动删除，禁用历史项不会参与合并。
+
+### 变量格式
+
 ```text
 http://yyb-go:8000@1
 http://yyb-go:8000@账号OpenID
@@ -100,7 +110,7 @@ bash /ql/data/scripts/yyb-scriptctl.sh install 麦富迪_code版.py \
 以单独上传 `example.py` 为例：
 
 1. 确认脚本支持通过 `YYB_SERVER` 读取账号。上传至青龙的 `local_yyb/example.py`（容器路径 `/ql/data/scripts/local_yyb/example.py`）。
-2. 在 YYB 服务的 `YYB_QINGLONG_REPO` 原值后追加 `,local_yyb`，保留已有目录，重建 / 重启 YYB 服务使配置生效。青龙任务里的环境变量不会改变 YYB 服务自身配置。
+2. 在 YYB 服务的 `YYB_QINGLONG_REPO` 原值后追加 `,local_yyb`，保留已有目录。Docker Compose 部署需要重新创建 YYB 容器以加载新环境变量（见下方排查）；原生程序需要重新启动。青龙任务里的环境变量不会改变 YYB 服务自身配置。
 3. 在青龙“定时任务”新建任务，命令为 `task local_yyb/example.py`，填写适合这个脚本的 Cron。若只希望 YYB 按账号执行，应将此原始任务设为**禁用**；禁用任务仍会被列出，避免它与 YYB 生成的账号任务重复执行。
 4. 回到 YYB“账号运行管理”，点击“刷新状态”，切换到“全部脚本”，搜索脚本名，为选中的账号配置 / 启用任务。
 
@@ -120,9 +130,41 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^wx-script/.*\.(js|py)
 
 在青龙订阅管理也可填写同样的地址、分支 `main`、白名单 `^wx-script/.*\.(js|py)$` 和后缀 `js py`。拉库定时例如 `0 */6 * * *`（每 6 小时），不等于脚本执行定时。
 
-拉库后，根据实际任务命令，把包含 `wx-script` 的目录追加到 YYB 的 `YYB_QINGLONG_REPO`，保留原有目录并重启 YYB。例如 `task lcmovie_YYB-GO-Script-i_main/wx-script/qqmusic.py` 对应 `lcmovie_YYB-GO-Script-i_main/wx-script`；是否带 `_main` 以实际目录为准。不要填写 GitHub 的 `/tree/main/...` 网页地址作为仓库地址。
+拉库后，根据实际任务命令，把包含 `wx-script` 的目录追加到 YYB 的 `YYB_QINGLONG_REPO`，保留原有目录，再重新创建 Docker 容器或重新启动原生程序。例如 `task lcmovie_YYB-GO-Script-i_main/wx-script/qqmusic.py` 对应 `lcmovie_YYB-GO-Script-i_main/wx-script`；是否带 `_main` 以实际目录为准。不要填写 GitHub 的 `/tree/main/...` 网页地址作为仓库地址。
 
 路径不变时，已有账号任务直接运行更新后的文件。如果只使用 YYB 账号任务，首次接入或新增脚本后，检查并禁用订阅生成的原始全局任务，避免重复运行。第三方仓库的筛选规则与业务接口由其作者维护，这里的订阅示例不代表已验证全部脚本的运行效果。
+
+## 新增脚本集合后仍不显示（Issue #100）
+
+青龙「脚本管理」中看到文件，只能证明文件已下载。请到「定时任务」核对是否存在对应任务，并复制其完整命令；工作台从这些任务发现脚本，不会直接扫描文件。
+
+例如 `SuperNaiBA/YYB-GO-Script` 中的 `AGLZJ.js`：
+
+```text
+task SuperNaiBA_YYB-GO-Script/AGLZJ.js
+```
+
+此命令对应的目录是 `SuperNaiBA_YYB-GO-Script`，不是另一个集合的 `lcmovie_YYB-GO-Script-i_main/wx-script`。若青龙实际命令使用 `SuperNaiBA_YYB-GO-Script_main/AGLZJ.js`，则配置也要包含 `SuperNaiBA_YYB-GO-Script_main`。不要只根据 GitHub 仓库名推断本地目录。
+
+若没有对应任务，可按文件头部的 Cron 创建一个**禁用**的原始任务供 YYB 发现；不要为了让它显示先运行签到。若已有任务，继续核对 YYB 容器中真正生效的目录配置：
+
+```bash
+# 容器名按实际修改；仅输出目录配置
+docker exec yyb-go printenv YYB_QINGLONG_REPO
+```
+
+Compose 中的 `${YYB_QINGLONG_REPO:-默认目录}` 只有在该变量未设置或为空时才使用冒号后的默认值。如果项目 `.env` 或启动 Compose 的 shell 已设置非空值，仅修改默认部分不会生效。应修改实际使用的变量值，保留需要的原目录、追加新目录；不需要把青龙所有脚本目录加入列表。
+
+在原 Compose 项目目录、使用原来的配置文件及 `.env` 执行（服务名按实际修改）：
+
+```bash
+docker compose up -d --no-build --force-recreate yyb-go
+docker exec yyb-go printenv YYB_QINGLONG_REPO
+```
+
+仅 `docker restart` 或 `docker compose restart` 不会加载修改后的环境变量。无需删除数据目录，也无需为目录配置重新构建镜像。确认生效后，回到 YYB「账号运行管理」刷新状态，在「全部脚本」搜索 `AGLZJ.js` 或「爱果乐之家」；「已配置」只显示当前账号已创建的任务。
+
+如仍未显示，请提供脱敏后的**完整任务命令、上方目录配置输出、面板类型和 YYB 版本**。这些信息可用于区分路径不匹配、配置未生效和面板 API 问题，无需提供密码或 OpenAPI 密钥。
 
 ## 跨服务器排错
 

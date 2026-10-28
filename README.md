@@ -38,6 +38,8 @@
 | 脚本管理 | 统一收录审核后的 YYB 多账号脚本；支持整库同步、单脚本拉取、拉取并创建任务 |
 | 部署维护 | Docker Compose、Android ARM64 Magisk、跨平台内嵌资源二进制；按运行平台提供更新入口 |
 
+v0.2.33 修复部分错误文本将账号误标为永久失效的问题：仅 access token 到期、代理 token 或传输错误保留重试，详见[约两小时失效排查](docs/proxy-keepalive.md#约两小时后失效的排查96)。新增[脚本可用性记录](scripts/README.md#脚本可用性记录97-2026-10-19)，标注验证日期与实际范围，未验证脚本不默认视为可用。v0.2.32 的[管理员本地密码恢复](docs/configuration.md#忘记管理员密码v0232-起)、[LongLink 域名回退](docs/proxy-keepalive.md#保活成功但-getcode-超时)、[呆呆变量按 ID 更新](docs/panel-integration.md#重复变量处理)与“保活走代理、小程序调用直连”继续保留。
+
 ## 部署选择
 
 | 方式 | 适用场景 | 入口 |
@@ -131,6 +133,8 @@ bash /ql/data/scripts/yyb-scriptctl.sh install 麦富迪_code版.py \
 
 手动上传的脚本不出现在“全部脚本”中？列表读取已配置目录内的**面板任务**，不是文件浏览器。请按[独立上传脚本接入步骤](docs/panel-integration.md#独立上传的脚本不在全部脚本里issue-73)配置目录、创建任务，再刷新列表。
 
+新增脚本集合后仍未显示？按[目录配置排查](docs/panel-integration.md#新增脚本集合后仍不显示issue-100)核对真实任务路径、Compose 变量覆盖和容器内生效值；仅重启容器不会加载修改后的环境变量。
+
 ## 调用协议接口
 
 `YYB_SERVER` 每行一个账号：
@@ -150,9 +154,14 @@ curl -X POST http://yyb-go:8000/wxapp/getCode \
 
 如果配置了 `YYB_PROTOCOL_TOKEN`，请求还需携带 `Authorization: Bearer <token>`。接口清单、公众号 OAuth 边界和 `operateWxData` 参数说明见 [协议接口说明](docs/protocol-api.md)，运行中的服务也提供 OpenAPI 页面。
 
+控制台可在「接口测试 → 协议令牌」填写；接口文档使用 `Authorize → ProtocolBearer`（只填令牌值）。控制台输入仅用于当前页面，刷新后清空，不影响账号管理和青龙配置。
+
+v0.2.34 修复了 #101 的协议令牌校验遗漏，统一保护资料查询等所有协议入口。旧版本仅配置令牌不足以修复此问题，需要更新服务；正确令牌仍可直接用于青龙等自动化调用，无需网页登录。
+
 ## 账号代理与保活
 
 - 直连、静态 HTTP CONNECT、SOCKS5 和动态 API 均按账号独立保存。
+- 小程序调用默认跟随账号连接模式，也可单独选择直连；扫码、资料查询与保活仍遵循原账号设置，重扫和 ID 整理不会重置该策略。
 - 动态 API 支持 `txt`、`json`、`json2` 及常见嵌套结构，并可复用命名的品赞、巨量配置。
 - 短效动态代理只用于扫码和临时请求，不参与账号长期保活。
 - 后台按凭据剩余时间触发刷新；微信明确拒绝 refresh token 后才标记为需要重扫。

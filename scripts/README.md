@@ -7,6 +7,83 @@
 授权 code/加密包等调用形式。青龙不再直接订阅原仓库，防止更新覆盖适配层；配置、
 青龙任务统一使用 `task 525815266_YYB-Go-Enhanced/scripts/脚本名.py`，脚本由本仓库审核发布。
 
+适配取码格式、通过语法检查不等于每个商户的真实登录与活动都已验证。脚本报错应区分 YYB 取码、商户登录、具体任务三个阶段，不能只凭其他脚本成功或“未配置代理”推断根因。
+
+<a id="脚本可用性记录97-2026-10-19"></a>
+
+## 脚本可用性记录（#97，2026-10-21）
+
+下表记录已取得证据的范围，不是实时检测。**没有列出的脚本一律视为业务未验证**，不能因为已收录、定时已启用、进程退出码为 0 或 YYB 取码成功，就标成全部可用。账号失效、代理不可达也不直接等于脚本失效。
+
+| 脚本 | 状态 | 验证日期与依据 | 已知范围与限制 |
+| --- | --- | --- | --- |
+| [中国联通](chinaUnicom.py) | 部分功能已验证 | 2026-10-12，维护者飞牛青龙 3 个 App Token 账号实测 | 登录、Token 续期、首页签到并复查通过；服务密码真实登录和其他活动未验证，不能直接使用 YYB 登录 |
+| [寻星电玩网页积分](findstars_web_points.py) | 部分功能已验证 | 2026-10-16，维护者飞牛青龙实测 | 本人授权 HAR 导入 FS-Token、领取闲置 N1 卡槽奖励并复查积分通过；不支持 YYB 代替公众号网页授权 |
+| [迪卡侬](迪卡侬_code版.py) | 用户反馈可用 | 2026-10-17，[#95 对照日志](https://github.com/525815266/YYB-Go-Enhanced/issues/95) | 反馈者账号签到成功，不代表维护者已验证全部任务或其他账号 |
+| [京东 CK 采集](京东CK采集_code版.py) | 待验证恢复 | 2026-10-10，[#81](https://github.com/525815266/YYB-Go-Enhanced/issues/81) | 已修复漏读重定向 Cookie；若上游仅返回 skey，仍无法生成完整 pt_key/pt_pin，未确认真实 CK 获取恢复 |
+| [爱隐形](爱隐形_code版.py) | 签到响应兼容已修复，完整业务待回测 | 2026-10-21，[#98](https://github.com/525815266/YYB-Go-Enhanced/pull/98) 解包线索、[#95](https://github.com/525815266/YYB-Go-Enhanced/issues/95) 会员登录反馈、维护者只读响应实测 | 兼容 `error_code=0` 与新格式 `code=1/success=true/failed=false`；维护者尚未验证会员签到成功 |
+| [东呈](东呈_code版.py) | 登录待适配 | 2026-10-21，[#95](https://github.com/525815266/YYB-Go-Enhanced/issues/95) 新反馈及源码核对 | code 登录接口原为推断，尚无成功链路依据；已修正签到失败计入成功、HTTP 失败接收 token、跨账号继承会话及已配置 blackbox 未发送的问题，不代表真实登录已恢复 |
+
+“定时已启用 / 运行中 / 已停用”只说明青龙任务状态，与上表的业务可用性分开看。此记录只对应本仓库脚本；同名的第三方脚本不继承验证结论。后续反馈请附准确文件名、版本、验证日期、成功或失败的业务步骤及脱敏日志，以便更新范围；不要公开 Token、Cookie、OpenID 或完整 HAR。目前控制台尚未展示这张状态表，也不会根据一条账号错误自动修改全局脚本状态。
+
+<a id="爱隐形适配状态95-2026-10-17"></a>
+<a id="爱隐形适配状态95--98-2026-10-19"></a>
+
+## 爱隐形适配状态（#95 / #98，2026-10-21）
+
+感谢 @greenwave1987 在 [PR #98](https://github.com/525815266/YYB-Go-Enhanced/pull/98) 提供小程序解包线索。`爱隐形_code版.py` 改用 `POST /sso/login/minalogin`，提交 `{"sourceChannel":"Mina","code":"微信登录code"}`，不再把 code 当作 `baselogin` 的参数。原 [UserId 脚本](https://github.com/3ixi/autoscripts/blob/bae528cb8d28ec751d86daea3bbd89a699b8ba2b/aiyx.py) 的 `baselogin` 路径不等于 code 换会员身份的流程。
+
+维护者在飞牛青龙对 2 个自有 YYB 账号实际取码、调用 minalogin，均返回 HTTP 200、顶层 `open_id / union_id / user_id` 字段与空 `error_code`。测试账号未取得会员 `user_id`，因此没有继续提交签到，也没有保存空身份；**这证明已到达身份响应阶段，尚不代表会员登录和签到已恢复**。脚本兼容顶层与 `data` 包裹的身份响应，并先检查业务失败码，避免错误响应中夹带 user_id 时误存缓存。
+
+签到查询缺少明确状态时停止；提交后再查询确认今日已签到，失败或未确认时不报告成功、不重复提交。HTTP/JSON 异常保留现有缓存，不输出原始登录响应。不自动注册、绑定手机号或猜测会员身份。
+
+10 月 21 日跟进 #95：用户已取得会员 `user_id`，但旧脚本只接受签到接口的 `error_code=0`。维护者通过不带会员身份的只读请求确认，当前 `getsignlist` 返回另一种格式：`code=1`、`success=true`、`failed=false`，并有 `data.todaySignInfo`；旧判断会误拒绝这类响应。现已兼容两种明确状态，签到提交、复查和资产校验共用判断；字段缺失、相互矛盾或 HTTP 错误仍失败。失败日志只列有限状态字段，不回显原始响应、Token 或会员身份。任务有失败账号时发送汇总后返回非零退出码。
+
+这次只读请求仅用于核对响应格式，**不证明任何会员已经签到**；维护者的测试账号仍未取得会员身份，完整签到需要反馈者回测。
+
+东呈另行核对了公开的 [Token 型脚本](https://github.com/zjk2017/ArcadiaScriptPublic/blob/main/BackUp/东呈.py)：签到请求带有 `blackbox` 参数，现已补齐 `DCJD_BLACKBOX` 的发送。保留原脚本接受的 `0 / 121300002` 状态，其中 `121300002` 的具体业务含义尚未独立验证，显示为兼容状态，不据此断言「今日已签到」或新增积分。这份来源没有 code 登录流程，因此不能用于证明当前推断登录接口有效；请针对东呈提供具体失败步骤和脱敏状态继续适配。
+
+更新本脚本即可，无需升级 YYB 服务（仍为 v0.2.33）。已有商户缓存保留。请先在官方小程序核对会员登录/手机号绑定，再用新版反馈会员 user_id 是否取得及签到复查结果；“没有 user_id”本身不能断言唯一原因是未注册。请移除真实 code、手机号、Cookie、Token 和 OpenID，不要把完整抓包直接发到公开 issue。#95 保持开放等待会员账号回测。
+
+## 顺丰脚本线索（#92，2026-10-16）
+
+已找到公开的 [SuperNaiBA/YYB-GO-Script 的 sfsy.py](https://github.com/SuperNaiBA/YYB-GO-Script/blob/c55efc23d219dd5b1b61dbd1699c185fa8203cb2/sfsy.py)：使用 `YYB_SERVER`，调用 `/wxapp/getCode`，以顺丰小程序 code 经过 UCMP `appOnLogin` 和活动页换取顺丰业务 Cookie，再执行签到等任务。它是第三方脚本，尚未收录或验证完整任务成功。
+
+当前公开源码能读取本项目 `data.result.code` 返回结构。业务 Cookie 到期时可重新登录获取，不代表 Cookie 永不过期，也不等于所有活动接口都长期有效。源码取码超时为 30 秒，可能早于 YYB 默认整体调用预算；接入前还需核对协议鉴权头、同名环境变量分隔方式与业务接口版本。若已启用 `YYB_PROTOCOL_TOKEN`，脚本取码请求必须携带对应 Bearer token。
+
+## 中国联通融合版（2026-10-12）
+
+`chinaUnicom.py` 基于现有 Python v1.1.0，融合用户提供的中国联通 JS v1.10 的
+RSA 服务密码登录，保留原活动与功能开关。使用 `chinaUnicomCookie`，多个账号按行或 `&` 分隔：
+
+```text
+联通Token#AppId
+联通Token#AppId#手机号
+手机号#服务密码
+```
+
+仅手机号会尝试本地缓存；已有 Token 优先使用缓存中的续期 Token。密码登录只在没有
+Token 或在线会话明确被拒绝时尝试一次，服务端要求短信/验证码时需本人完成验证。
+网络故障不会触发重复密码登录，也不会清空或覆盖已保存凭据。
+
+依赖 `requests`、`pycryptodome`，原任务仍可使用 `task chinaUnicom.py`。建议先设置
+`UNICOM_TEST_MODE=login` 验证登录；`sign` 仅执行首页签到并复查；`query` 仅查询，
+这些模式不执行账号间分享浏览或发送通知。取消该变量后按脚本原开关运行日常任务。
+缓存默认保存在脚本目录 `unicom_token_cache.json`，可用 `UNICOM_TOKEN_CACHE_PATH` 指定
+固定路径；升级脚本时保留缓存文件。
+
+本次飞牛青龙实测：现有 3 组 Token 登录成功，全部取得轮换 Token；首页签到逐账号
+提交后复查均为已签到，每个账号返回 `+0.01元`。服务密码登录已通过 RSA、错误响应及
+缓存回归测试，本地未配置服务密码账号，因此尚未验证真实密码登录成功。
+另发现本地代理平台拒绝提取，原因为出口未加入白名单；现在识别该错误后本轮只请求
+一次，明确提示并沿用原脚本的本地 IP 回退，不会给每个账号重复提取五次。
+
+**YYB 接入范围：** 这些 App 活动需要联通 `token_online` / `ecs_token`。当前检查到的
+联通脚本，包括公开 YYB 脚本目录中的 `lt.py`，仍然使用联通 App Token；没有找到
+`wx.login code → 联通 App Token` 的业务兑换链路。`YYB_SERVER` 可继续给其他小程序
+脚本使用，不能直接替代本脚本的 `chinaUnicomCookie`。若提供实际联通小程序登录请求
+或对应脚本，可继续验证小程序授权能运行哪些活动，不会将小程序 code 冒充 App Token。
+
 ## 青龙脚本拉取工具
 
 Issue #66 中出现的 `Tuple[Dict[str, str] ...`、`str) ->` 等任务名，不是脚本原本的名称。
@@ -92,6 +169,7 @@ v0.2.19 起服务端也兼容旧脚本的 `/healthz`。同一服务地址只探�
 
 ## 已修复
 
+- `京东CK采集_code版.py`：区分完整 `pt_key/pt_pin` 与仅下发 `skey` 的响应；缺少票据时不生成或缓存 `JD_COOKIE`，HTTP 错误也不接受响应票据。失败日志只显示状态码和票据是否存在，不打印原始登录正文。完成京东绑定不保证下发 `pt_key`，`skey` 不能直接替代它。脚本保留历史 AppID `wx2f5d8f9715c59d10`；目前没有验证过改用 `wx91d27dbf599dff74` 后取得 `pt_key` 的新方案，不能承诺更换 AppID 即恢复。后续进展见 [#81](https://github.com/525815266/YYB-Go-Enhanced/issues/81)。这次更新只需重新拉取脚本。
 - `DDYX.py`、`DSMMHYSCQD.py`、`DSTX.py`、`DTSH.py`、`JTC.py`、`JYXEJYFHS.py`、`LDXQ.py`、`NWDJG.py`、`NXDC.py`、`QC.py`、`SANF.py`、`THYC.py`、`XFJ.py`、`byd_sign.py`：修复 `YYB_SERVER` 配置提示代码的缩进错误。
 - `WRN.py`：补充实际运行所需的 `sys` 导入。
 - `MS.js`：兼容会员信息的新旧返回结构，缺少 `memberId` 时停止当前账号，避免连续异常。
@@ -187,15 +265,25 @@ YYB 开启鉴权时设置可选环境变量 `YYB_API_KEY`。脚本不再使用�
 重新执行上游订阅可能会覆盖这些修复，建议在订阅更新后重新检查。脚本仍受原项目授权和条款约束。
 # 寻星电玩网页积分
 
-`findstars_web_points.py` 调用寻星电玩网页的活动任务接口，领取服务端返回为 `complete` 的积分任务并汇总积分变化。
+`findstars_web_points.py` 调用寻星电玩网页的活动任务接口，按官网的任务进度、总领取上限判断是否可领取，并复查领取后的积分和任务状态。日常任务命令仍为 `task findstars_web_points.py`。
 
-网页授权完成后，从浏览器请求中复制 `FS-Token`，在青龙创建环境变量：
+推荐从本人已完成网页登录授权的 HAR 导入登录态，无需手动找令牌：
+
+```bash
+python3 findstars_web_points.py --import-har /path/to/authorized.har --label 网页账号
+```
+
+导入只验证用户身份、保存令牌，不提交领取。缓存默认位于 `/ql/data/config/findstars_web_tokens.json`，容器重启后保留；非青龙环境默认使用用户目录下的 `.config/yyb-go/`，可用 `FINDSTARS_TOKEN_CACHE` 指定路径。同备注的导入缓存优先于旧变量；已有缓存绑定其他用户时拒绝覆盖。沿用旧环境变量时，`--label` 填原变量的备注，例如 `网页账号`，避免同时保留失效的旧配置。
+
+也可从本人浏览器请求中复制 `FS-Token`，在青龙创建环境变量：
 
 ```text
 FINDSTARS_TOKENS=备注#FS-Token
 ```
 
-多个账号按行填写。该令牌属于寻星网页登录态，不是 YYB 的小程序 OpenID；YYB 无法凭公众号 OpenID 直接生成它。令牌失效后脚本会提示重新网页登录授权，不会伪造积分或授权结果。
+多个账号按行或 `&` 分隔，也兼容 `FINDSTARS_TOKEN` / `FINDSTARS_FS_TOKEN`。`FINDSTARS_DRY_RUN=1` 只查询、不领取。领取超时不自动重放；登录态过期、领取失败或结果待核对时退出码为 1，不再把失败当作正常执行。
+
+该令牌属于寻星网页登录态，不是 YYB 的小程序 OpenID。2026-10-16 实测：公众号 H5 OAuth 授权成功后，导入 HAR 可以恢复积分任务；当前 YYB 公众号调用返回 `invalid api_name`，尚无已验证的自动换取或续期方案。令牌再次失效时仍需本人重新授权并导入。HAR 和缓存含账号凭据，请勿提交到仓库或公开分享。
 
 # 百花约跑团线上投票
 
