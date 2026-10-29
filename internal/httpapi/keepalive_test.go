@@ -17,12 +17,12 @@ func TestRefreshAccountRenewsDueCredentials(t *testing.T) {
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-due", time.Now().Add(10*time.Minute))
 	calls := 0
-	app.refreshLoginBuffer = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
+	app.refreshCredentials = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
 		calls++
 		creds.AccessToken = "access-new"
 		creds.RefreshToken = "refresh-new"
 		creds.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
-		return protocol.LoginBufferResult{LoginBuffer: "buffer-new", Credentials: creds, Refreshed: true}, nil
+		return creds, nil
 	}
 
 	status, refreshed, err := app.refreshAccount(context.Background(), acc, false)
@@ -36,7 +36,7 @@ func TestRefreshAccountRenewsDueCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAccount() error = %v", err)
 	}
-	if updated.LoginBuffer != "buffer-new" || updated.Credentials["accesstoken"] != "access-new" || updated.Credentials["refreshtoken"] != "refresh-new" {
+	if updated.LoginBuffer != "buffer-old" || updated.Credentials["accesstoken"] != "access-new" || updated.Credentials["refreshtoken"] != "refresh-new" {
 		t.Fatalf("updated credentials = %#v, login buffer = %q", updated.Credentials, updated.LoginBuffer)
 	}
 	if observed, ok := updated.Credentials["refresh_token_observed_at"]; ok && protocol.CredentialsFromMap(map[string]any{"refresh_token_observed_at": observed}).RefreshTokenObservedAt != 0 {
@@ -50,10 +50,10 @@ func TestRefreshingOneLegacyAccountDoesNotBackfillAnother(t *testing.T) {
 
 	first := insertKeepAliveTestAccount(t, app, "openid-legacy-first", time.Now().Add(10*time.Minute))
 	second := insertKeepAliveTestAccount(t, app, "openid-legacy-second", time.Now().Add(10*time.Minute))
-	app.refreshLoginBuffer = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
+	app.refreshCredentials = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
 		creds.AccessToken = "access-refreshed"
 		creds.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
-		return protocol.LoginBufferResult{LoginBuffer: "buffer-refreshed", Credentials: creds, Refreshed: true}, nil
+		return creds, nil
 	}
 
 	if _, _, err := app.refreshAccount(context.Background(), first, false); err != nil {
@@ -74,9 +74,9 @@ func TestRefreshAccountSkipsFreshCredentials(t *testing.T) {
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-fresh", time.Now().Add(2*time.Hour))
 	calls := 0
-	app.refreshLoginBuffer = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
+	app.refreshCredentials = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
 		calls++
-		return protocol.LoginBufferResult{}, nil
+		return protocol.LoginBufferCredentials{}, nil
 	}
 
 	status, refreshed, err := app.refreshAccount(context.Background(), acc, false)
@@ -114,14 +114,14 @@ func TestRefreshAccountRetriesAfterFailure(t *testing.T) {
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-retry", time.Now().Add(10*time.Minute))
 	calls := 0
-	app.refreshLoginBuffer = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
+	app.refreshCredentials = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
 		calls++
 		if calls == 1 {
-			return protocol.LoginBufferResult{}, errors.New("temporary failure")
+			return protocol.LoginBufferCredentials{}, errors.New("temporary failure")
 		}
 		creds.AccessToken = "access-recovered"
 		creds.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
-		return protocol.LoginBufferResult{LoginBuffer: "buffer-recovered", Credentials: creds, Refreshed: true}, nil
+		return creds, nil
 	}
 
 	status, _, err := app.refreshAccount(context.Background(), acc, false)
@@ -162,9 +162,9 @@ func TestManualLivenessCheckDoesNotRotateFreshCredentials(t *testing.T) {
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-manual-fresh", time.Now().Add(2*time.Hour))
 	calls := 0
-	app.refreshLoginBuffer = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
+	app.refreshCredentials = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
 		calls++
-		return protocol.LoginBufferResult{}, errors.New("should not refresh fresh credentials")
+		return protocol.LoginBufferCredentials{}, errors.New("should not refresh fresh credentials")
 	}
 
 	status, err := app.refreshLiveness(context.Background(), acc)
@@ -178,8 +178,8 @@ func TestForcedTransientRefreshFailureDoesNotExpireFreshAccount(t *testing.T) {
 	defer app.Close()
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-force-transient", time.Now().Add(2*time.Hour))
-	app.refreshLoginBuffer = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
-		return protocol.LoginBufferResult{}, errors.New("proxy connection timed out")
+	app.refreshCredentials = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
+		return protocol.LoginBufferCredentials{}, errors.New("proxy connection timed out")
 	}
 
 	status, refreshed, err := app.refreshAccount(context.Background(), acc, true)
@@ -197,8 +197,8 @@ func TestTransientRefreshFailureAfterAccessExpiryRemainsRetryable(t *testing.T) 
 	defer app.Close()
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-expired-access", time.Now().Add(-time.Minute))
-	app.refreshLoginBuffer = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
-		return protocol.LoginBufferResult{}, errors.New("proxy API temporarily unavailable")
+	app.refreshCredentials = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
+		return protocol.LoginBufferCredentials{}, errors.New("proxy API temporarily unavailable")
 	}
 
 	status, refreshed, err := app.refreshAccount(context.Background(), acc, false)
@@ -216,8 +216,8 @@ func TestDefinitiveRefreshRejectionExpiresAccount(t *testing.T) {
 	defer app.Close()
 
 	acc := insertKeepAliveTestAccount(t, app, "openid-refresh-rejected", time.Now().Add(2*time.Hour))
-	app.refreshLoginBuffer = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
-		return protocol.LoginBufferResult{}, &protocol.RefreshRejectedError{Code: 401, Message: "refresh token expired"}
+	app.refreshCredentials = func(_ context.Context, _ protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
+		return protocol.LoginBufferCredentials{}, &protocol.RefreshRejectedError{Code: 401, Message: "refresh token expired"}
 	}
 
 	status, refreshed, err := app.refreshAccount(context.Background(), acc, true)
@@ -265,14 +265,14 @@ func TestAccessTokenRejectionCanRecoverWithoutRescan(t *testing.T) {
 	defer app.Close()
 	acc := insertKeepAliveTestAccount(t, app, "openid-access-retry", time.Now().Add(-time.Minute))
 	calls := 0
-	app.refreshLoginBuffer = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
+	app.refreshCredentials = func(_ context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
 		calls++
 		if calls == 1 {
-			return protocol.LoginBufferResult{}, &protocol.RefreshRejectedError{Code: -109, Message: "access_token expired"}
+			return protocol.LoginBufferCredentials{}, &protocol.RefreshRejectedError{Code: -109, Message: "access_token expired"}
 		}
 		creds.AccessToken = "access-recovered"
 		creds.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
-		return protocol.LoginBufferResult{LoginBuffer: "buffer-recovered", Credentials: creds, Refreshed: true}, nil
+		return creds, nil
 	}
 	status, refreshed, err := app.refreshAccount(context.Background(), acc, false)
 	if err == nil || refreshed || status != "unknown" {
@@ -292,6 +292,50 @@ func TestTencent42007ExpiresAccount(t *testing.T) {
 	err := &protocol.RefreshRejectedError{Code: -109, Message: "WXRefresh go error, code: 42007, msg access_token and refresh_token exception"}
 	if !definitiveCredentialFailure(err) {
 		t.Fatal("42007 refresh token rejection should require a rescan")
+	}
+}
+
+func TestCredentialFailureChecksEveryJoinedCause(t *testing.T) {
+	ambiguous := &protocol.RefreshRejectedError{Code: -109, Operation: "refresh_token", Message: "RC_PARAMS_INVALID"}
+	rejected := &protocol.RefreshRejectedError{Code: -109, Operation: "check_login", Message: "error 42007 | 42007"}
+	for _, failure := range []error{
+		fmt.Errorf("%w; check login: %w", ambiguous, rejected),
+		fmt.Errorf("recovery: %w", errors.Join(ambiguous, fmt.Errorf("check login: %w", rejected))),
+		errors.Join(ambiguous, &protocol.LoginBufferRejectedError{Code: 40188, Message: "invalid scope"}),
+	} {
+		if !definitiveCredentialFailure(failure) {
+			t.Fatalf("explicit rejection hidden by earlier ambiguous failure: %v", failure)
+		}
+	}
+	for _, failure := range []error{
+		errors.Join(ambiguous, context.DeadlineExceeded),
+		errors.Join(ambiguous, errors.New("proxy error 42007, refresh_token expired")),
+		errors.Join(ambiguous, &protocol.RefreshRejectedError{Code: -109, Message: "access_token expired"}),
+	} {
+		if definitiveCredentialFailure(failure) {
+			t.Fatalf("retryable joined failure expired an account: %v", failure)
+		}
+	}
+}
+
+func TestOfficialNumericRefreshRejectionsExpireAccount(t *testing.T) {
+	for _, message := range []string{
+		"CheckWXToken wx refresh return error 42007 | 42007",
+		"CheckWXToken wx refresh return error 42002 | 42002",
+		"CheckWXToken wx refresh return error 40030 | 40030",
+	} {
+		err := &protocol.RefreshRejectedError{Code: -109, Message: message}
+		if !definitiveCredentialFailure(err) {
+			t.Errorf("known WeChat rejection left account alive: %s", message)
+		}
+		if definitiveCredentialFailure(errors.New(message)) {
+			t.Fatal("untyped transport error expired account")
+		}
+	}
+	for _, message := range []string{"error 142007 | 142007", "error 420070 | 420070", "access_token expired 42001", "RC_PARAMS_INVALID rid=abc42007def", "RC_PARAMS_INVALID rid: 42007"} {
+		if definitiveCredentialFailure(&protocol.RefreshRejectedError{Code: -109, Message: message}) {
+			t.Errorf("unrecognized rejection expired account: %s", message)
+		}
 	}
 }
 

@@ -72,6 +72,16 @@ type AppSession struct {
 	HostAppID []byte
 }
 
+// ManualAuthRejectedError is returned before a JSAPI operation is sent.
+// A rejected login buffer is different from an incompatible response schema.
+type ManualAuthRejectedError struct {
+	Code int64
+}
+
+func (e *ManualAuthRejectedError) Error() string {
+	return fmt.Sprintf("ManualAuth rejected: code=%d", e.Code)
+}
+
 func parseLoginBuffer(loginBufferB64 string) (loginMeta, error) {
 	raw, err := base64.StdEncoding.DecodeString(loginBufferB64)
 	if err != nil {
@@ -108,13 +118,15 @@ func buildManualAuthRequest(loginBufferB64 string, appDeviceID []byte) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	appBase := append(pbLen(1, appDeviceID), pbVar(2, appVersion)...)
+	appBase := pbLen(1, appDeviceID)
 	thirdApp := pbLen(1, meta.Ticket)
 	out := make([]byte, 0, len(appBase)+len(thirdApp)+32)
 	out = append(out, pbLen(1, appBase)...)
+	// The official ManualAuthRequest serializer emits version as outer field 2;
+	// AppBaseRequest only contains the device ID. See the native layout fixture.
+	out = append(out, pbVar(2, appVersion)...)
 	out = append(out, pbLen(3, thirdApp)...)
 	out = append(out, pbVar(4, 4)...)
-	out = append(out, pbLen(6, nil)...)
 	out = append(out, pbVar(7, 0)...)
 	out = append(out, pbVar(8, 6)...)
 	return out, nil
@@ -326,6 +338,11 @@ func hybridECDHDecrypt(response []byte, temp *manualAuthTemp) ([]byte, error) {
 
 func extractSession(mar []byte) (AppSession, error) {
 	F := pbParse(mar)
+	if base, ok := F[1].([]byte); ok {
+		if code, ok := pbParse(base)[1].(int64); ok && code != 0 {
+			return AppSession{}, &ManualAuthRejectedError{Code: code}
+		}
+	}
 	f3, ok := F[3].([]byte)
 	if !ok {
 		return AppSession{}, fmt.Errorf("ManualAuthResponse missing f3")

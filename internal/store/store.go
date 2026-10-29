@@ -134,23 +134,25 @@ type DB struct {
 }
 
 type WechatAccount struct {
-	ID            int64          `json:"id"`
-	OpenID        string         `json:"openid"`
-	UIN           *int64         `json:"uin,omitempty"`
-	Alias         *string        `json:"alias,omitempty"`
-	Nickname      *string        `json:"nickname,omitempty"`
-	Remark        *string        `json:"remark,omitempty"`
-	Avatar        *string        `json:"avatar,omitempty"`
-	UserInfo      map[string]any `json:"user_info,omitempty"`
-	LoginBuffer   string         `json:"login_buffer,omitempty"`
-	Credentials   map[string]any `json:"credentials,omitempty"`
-	Status        *string        `json:"status,omitempty"`
-	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
-	CreatedAt     int64          `json:"created_at"`
-	UpdatedAt     int64          `json:"updated_at"`
+	ID             int64          `json:"id"`
+	OpenID         string         `json:"openid"`
+	UIN            *int64         `json:"uin,omitempty"`
+	Alias          *string        `json:"alias,omitempty"`
+	Nickname       *string        `json:"nickname,omitempty"`
+	Remark         *string        `json:"remark,omitempty"`
+	Avatar         *string        `json:"avatar,omitempty"`
+	UserInfo       map[string]any `json:"user_info,omitempty"`
+	LoginBuffer    string         `json:"login_buffer,omitempty"`
+	Credentials    map[string]any `json:"credentials,omitempty"`
+	Status         *string        `json:"status,omitempty"`
+	LastCheckedAt  *int64         `json:"last_checked_at,omitempty"`
+	CreatedAt      int64          `json:"created_at"`
+	UpdatedAt      int64          `json:"updated_at"`
+	credentialJSON sql.NullString
 }
 
 type AccountPublic struct {
+	ScanProduct            string  `json:"scan_product"`
 	ID                     int64   `json:"id"`
 	OpenID                 string  `json:"openid"`
 	UIN                    *int64  `json:"uin"`
@@ -260,7 +262,25 @@ func (db *DB) Close() error {
 	if db == nil || db.sql == nil {
 		return nil
 	}
-	return db.sql.Close()
+	err := db.sql.Close()
+	if db.sql.Stats().OpenConnections == 0 {
+		return err
+	}
+	// sql.DB.Close stops new queries but does not wait for an in-flight
+	// connection opener. SQLite may still create/remove WAL files in that
+	// interval, so callers must not remove the data directory yet.
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for db.sql.Stats().OpenConnections != 0 {
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			return errors.Join(err, errors.New("database close: pending connections did not stop within 5s"))
+		}
+	}
+	return err
 }
 
 func (db *DB) EnsureDefaultFeatures(ctx context.Context) error {
@@ -733,6 +753,42 @@ func (db *DB) SetAccountCredentialStatus(ctx context.Context, id int64, loginBuf
 	return err
 }
 
+// ApplyCredentialRefresh rejects results from requests that started before a
+// rescan, manual status change, deletion or ID compaction. Keep the exact JSON
+// read from SQLite: reserializing an imported record may change whitespace/order.
+func (db *DB) ApplyCredentialRefresh(ctx context.Context, expected *WechatAccount, loginBuffer string, credentials map[string]any, status string) (bool, error) {
+	if status == "expired" {
+		loginBuffer, credentials = "", nil
+	}
+	encoded, err := marshalNullable(credentials)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().Unix()
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx,
+		`UPDATE wechat_accounts SET login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=?
+WHERE id=? AND openid=? AND credentials IS ? AND login_buffer=? AND status IS ?`,
+		loginBuffer, encoded, status, now, now, expected.ID, expected.OpenID, expected.credentialJSON, expected.LoginBuffer, nullableString(expected.Status))
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if count == 1 && status == "expired" {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=?", expected.ID); err != nil {
+			return false, err
+		}
+	}
+	return count == 1, tx.Commit()
+}
+
 func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) error {
 	now := time.Now().Unix()
 	if status == "expired" {
@@ -758,6 +814,16 @@ func (db *DB) GetSession(ctx context.Context, accountID int64, tcpProxy string) 
 	row := db.sql.QueryRowContext(ctx,
 		"SELECT id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at FROM sessions WHERE wechat_account_id=? AND tcp_proxy=? AND expires_at>?",
 		accountID, tcpProxy, time.Now().Unix(),
+	)
+	return scanSession(row)
+}
+
+// GetSessionForRecovery also reads a legacy local-cache deadline. The caller
+// must validate the issued PSK deadline before attempting to reuse the state.
+func (db *DB) GetSessionForRecovery(ctx context.Context, accountID int64, tcpProxy string) (*SessionRow, error) {
+	row := db.sql.QueryRowContext(ctx,
+		"SELECT id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at FROM sessions WHERE wechat_account_id=? AND tcp_proxy=?",
+		accountID, tcpProxy,
 	)
 	return scanSession(row)
 }
@@ -856,6 +922,10 @@ func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, erro
 }
 
 func (a *WechatAccount) Public() AccountPublic {
+	product := "appstore"
+	if strings.HasPrefix(a.OpenID, "pcmgr:") {
+		product = "pcmgr"
+	}
 	var refreshTokenObservedAt *int64
 	rescanRecommended := false
 	var credentialExpiresAt *int64
@@ -882,11 +952,12 @@ func (a *WechatAccount) Public() AccountPublic {
 		// A transient refresh failure is kept as unknown for retry purposes, but
 		// once the cached credential is past its expiry the UI should still guide
 		// the operator to rescan instead of leaving the account looking healthy.
-		if !rescanRecommended && (a.Status == nil || strings.EqualFold(strings.TrimSpace(*a.Status), "unknown")) && expiresAt <= time.Now().Unix() {
+		if product != "pcmgr" && !rescanRecommended && (a.Status == nil || strings.EqualFold(strings.TrimSpace(*a.Status), "unknown")) && expiresAt <= time.Now().Unix() {
 			rescanRecommended = true
 		}
 	}
 	return AccountPublic{
+		ScanProduct:            product,
 		ID:                     a.ID,
 		OpenID:                 a.OpenID,
 		UIN:                    a.UIN,
@@ -972,6 +1043,7 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	if credJSON.Valid && credJSON.String != "" {
 		_ = json.Unmarshal([]byte(credJSON.String), &a.Credentials)
 	}
+	a.credentialJSON = credJSON
 	return &a, nil
 }
 

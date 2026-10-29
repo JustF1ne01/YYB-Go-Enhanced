@@ -11,14 +11,19 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
+
+	"yyb_go/internal/pcmgr"
 )
 
 var ErrMissingRefreshToken = errors.New("missing refresh token")
 
 type RefreshRejectedError struct {
-	Code    int
-	Message string
+	Code      int
+	Message   string
+	Operation string
 }
 
 func (e *RefreshRejectedError) Error() string {
@@ -40,20 +45,25 @@ const (
 	yybHost         = "https://yybadaccess.3g.qq.com"
 	loginBufferURL  = yybHost + "/pc_yyb_auth/pcyyb_get_wx_login_buffer_auth"
 	refreshTokenURL = yybHost + "/pc_yyb_auth/pcyyb_refresh_token_auth"
+	mainRefreshURL  = yybHost + "/pc_yyb/pcyyb_refresh_token"
+	checkLoginURL   = yybHost + "/pc_yyb/pcyyb_check_login"
 	userInfoURL     = yybHost + "/pc_yyb/pcyyb_get_user_info"
 	loginBusinessID = "pc_yyb_auth"
 	loginAccessKey  = "wgrdg373hy26ww2"
 )
 
 type LoginBufferCredentials struct {
-	OpenID                 string `json:"openid"`
-	AccessToken            string `json:"accesstoken"`
-	RefreshToken           string `json:"refreshtoken"`
-	RefreshTokenObservedAt int64  `json:"refresh_token_observed_at"`
-	LoginType              string `json:"logintype"`
-	Nickname               string `json:"nickname"`
-	ExpiresAt              int64  `json:"expires_at"`
-	ExpiresIn              int64  `json:"expires_in"`
+	Provider               string            `json:"provider,omitempty"`
+	PCMgr                  pcmgr.Credentials `json:"pcmgr,omitempty"`
+	OpenID                 string            `json:"openid"`
+	AccessToken            string            `json:"accesstoken"`
+	RefreshToken           string            `json:"refreshtoken"`
+	RefreshTokenObservedAt int64             `json:"refresh_token_observed_at"`
+	RefreshBusinessID      string            `json:"refresh_business_id"`
+	LoginType              string            `json:"logintype"`
+	Nickname               string            `json:"nickname"`
+	ExpiresAt              int64             `json:"expires_at"`
+	ExpiresIn              int64             `json:"expires_in"`
 }
 
 func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
@@ -64,11 +74,18 @@ func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
 			expiresAt = refreshedAt + expiresIn
 		}
 	}
+	var pc pcmgr.Credentials
+	if value, ok := m["pcmgr"]; ok {
+		raw, _ := json.Marshal(value)
+		_ = json.Unmarshal(raw, &pc)
+	}
 	return LoginBufferCredentials{
+		Provider: stringFromMap(m, "provider"), PCMgr: pc,
 		OpenID:                 stringFromMap(m, "openid"),
 		AccessToken:            stringFromMap(m, "accesstoken"),
 		RefreshToken:           stringFromMap(m, "refreshtoken"),
 		RefreshTokenObservedAt: int64FromMap(m, "refresh_token_observed_at"),
+		RefreshBusinessID:      stringFromMap(m, "refresh_business_id"),
 		LoginType:              defaultString(stringFromMap(m, "logintype"), "WX"),
 		Nickname:               stringFromMap(m, "nickname"),
 		ExpiresAt:              expiresAt,
@@ -77,17 +94,25 @@ func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
 }
 
 func (c LoginBufferCredentials) ToMap() map[string]any {
-	return map[string]any{
+	result := map[string]any{
 		"openid":                    c.OpenID,
 		"accesstoken":               c.AccessToken,
 		"refreshtoken":              c.RefreshToken,
 		"refresh_token_observed_at": c.RefreshTokenObservedAt,
+		"refresh_business_id":       c.RefreshBusinessID,
 		"logintype":                 defaultString(c.LoginType, "WX"),
 		"nickname":                  c.Nickname,
 		"expires_at":                c.ExpiresAt,
 		"expires_in":                defaultInt64(c.ExpiresIn, 7200),
 		"refresh_refreshed_at":      time.Now().Unix(),
 	}
+	if c.Provider != "" {
+		result["provider"] = c.Provider
+	}
+	if c.Provider == "pcmgr" {
+		result["pcmgr"] = c.PCMgr
+	}
+	return result
 }
 
 // ToMapForScan serializes credentials captured from a successful QR scan.
@@ -103,6 +128,9 @@ func (c LoginBufferCredentials) ToMapForScan() map[string]any {
 }
 
 func (c LoginBufferCredentials) Expired(skew time.Duration) bool {
+	if c.Provider == "pcmgr" {
+		return c.PCMgr.Validate() != nil
+	}
 	return time.Now().Add(skew).Unix() >= c.ExpiresAt
 }
 
@@ -132,6 +160,12 @@ func NewLoginBufferClientWithHTTPClient(httpClient *http.Client, timeout time.Du
 }
 
 func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBufferCredentials) (string, error) {
+	if creds.Provider == "pcmgr" {
+		return pcmgr.FetchBuffer(ctx, c.httpClient, creds.PCMgr)
+	}
+	if creds.Provider != "" && creds.Provider != "appstore" {
+		return "", fmt.Errorf("unsupported credential provider")
+	}
 	body, err := json.Marshal(loginBufferRequest{
 		ExtInfo: loginExtInfo{
 			ListS: loginListS{
@@ -146,7 +180,7 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 		return "", err
 	}
 	ts, nonce := timestampMS(), nonce4()
-	var data map[string]any
+	var data loginCredentialResponse
 	if err = c.requestJSON(ctx, http.MethodPost, loginBufferURL, body, map[string]string{
 		"Content-Type":          "application/json",
 		"Ual-Access-Businessid": loginBusinessID,
@@ -157,10 +191,14 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 	}, &data); err != nil {
 		return "", err
 	}
-	if code := intFromAny(data["code"]); code != 0 {
-		return "", &LoginBufferRejectedError{Code: code, Message: fmt.Sprint(data["msg"])}
+	code, err := credentialResponseCode(data.Code)
+	if err != nil {
+		return "", err
 	}
-	values := stringSlicePath(data, "ext_info", "list_s", "login_buffer", "value")
+	if code != 0 {
+		return "", &LoginBufferRejectedError{Code: code, Message: redactCredentials(fmt.Sprint(data.Message), creds)}
+	}
+	values := stringSlicePath(data.ExtInfo, "list_s", "login_buffer", "value")
 	if len(values) == 0 || values[0] == "" {
 		return "", fmt.Errorf("login_buffer response is empty")
 	}
@@ -168,6 +206,46 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 }
 
 func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
+	if creds.Provider == "pcmgr" {
+		pc, err := pcmgr.Renew(ctx, c.httpClient, creds.PCMgr)
+		if err != nil {
+			return LoginBufferCredentials{}, err
+		}
+		creds.PCMgr = pc
+		creds.ExpiresAt = pc.NextRenewAt()
+		creds.ExpiresIn = creds.ExpiresAt - pc.RenewedAt
+		return creds, nil
+	}
+	if creds.Provider != "" && creds.Provider != "appstore" {
+		return LoginBufferCredentials{}, fmt.Errorf("unsupported credential provider")
+	}
+	// QR credentials come from /pc_yyb/pcyyb_oauth, including legacy records
+	// without a source marker. wxapp's separate authorization uses _auth.
+	business, endpoint, key := "pc_yyb", mainRefreshURL, ""
+	if creds.RefreshBusinessID == loginBusinessID {
+		business, endpoint, key = loginBusinessID, refreshTokenURL, loginAccessKey
+	} else if creds.RefreshBusinessID != "" && creds.RefreshBusinessID != business {
+		return LoginBufferCredentials{}, fmt.Errorf("unsupported credential refresh business")
+	}
+	refreshed, err := c.requestCredentials(ctx, creds, endpoint, business, key)
+	var rejected *RefreshRejectedError
+	if business == "pc_yyb" && errors.As(err, &rejected) && rejected.Code == -109 && ctx.Err() == nil {
+		// -109 is a wrapper, not proof of revocation. Official check-login may
+		// recover/rotate credentials or expose the underlying WeChat rejection.
+		checked, checkErr := c.CheckLogin(ctx, creds)
+		if checkErr == nil {
+			return checked, nil
+		}
+		return LoginBufferCredentials{}, fmt.Errorf("%w; check login: %w", err, checkErr)
+	}
+	return refreshed, err
+}
+
+func (c *LoginBufferClient) CheckLogin(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
+	return c.requestCredentials(ctx, creds, checkLoginURL, "pc_yyb", "")
+}
+
+func (c *LoginBufferClient) requestCredentials(ctx context.Context, creds LoginBufferCredentials, endpoint, business, key string) (LoginBufferCredentials, error) {
 	if creds.RefreshToken == "" {
 		return LoginBufferCredentials{}, ErrMissingRefreshToken
 	}
@@ -181,22 +259,38 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 		return LoginBufferCredentials{}, err
 	}
 	ts, nonce := timestampMS(), nonce4()
-	var data map[string]any
-	if err = c.requestJSON(ctx, http.MethodPost, refreshTokenURL, body, map[string]string{
+	var data loginCredentialResponse
+	if err = c.requestJSON(ctx, http.MethodPost, endpoint, body, map[string]string{
 		"Content-Type":          "application/json",
-		"Ual-Access-Businessid": loginBusinessID,
+		"Ual-Access-Businessid": business,
 		"Ual-Access-Timestamp":  ts,
 		"Ual-Access-Nonce":      nonce,
-		"Ual-Access-Signature":  sign(string(body), nonce, ts, loginAccessKey),
+		"Ual-Access-Signature":  sign(string(body), nonce, ts, key),
 	}, &data); err != nil {
 		return LoginBufferCredentials{}, err
 	}
-	if code := intFromAny(data["code"]); code != 0 {
-		return LoginBufferCredentials{}, &RefreshRejectedError{Code: code, Message: fmt.Sprint(data["msg"])}
+	code, err := credentialResponseCode(data.Code)
+	if err != nil {
+		return LoginBufferCredentials{}, err
 	}
-	info, _ := data["user_info"].(map[string]any)
+	if code != 0 {
+		operation := "refresh_token"
+		if endpoint == checkLoginURL {
+			operation = "check_login"
+		}
+		return LoginBufferCredentials{}, &RefreshRejectedError{Code: code, Message: redactCredentials(fmt.Sprint(data.Message), creds), Operation: operation}
+	}
+	info := data.UserInfo
+	if openID := stringFromMap(info, "open_id"); openID != "" && openID != creds.OpenID {
+		return LoginBufferCredentials{}, fmt.Errorf("credential response account mismatch")
+	}
+	if loginType := stringFromMap(info, "login_type"); loginType != "" && loginType != defaultString(creds.LoginType, "WX") {
+		return LoginBufferCredentials{}, fmt.Errorf("credential response login type mismatch")
+	}
 	expiresIn := defaultInt64(int64FromMap(info, "expires_in"), 7200)
 	refreshed := creds
+	refreshed.RefreshBusinessID = business
+	refreshed.LoginType = defaultString(creds.LoginType, "WX")
 	refreshed.AccessToken = stringFromMap(info, "access_token")
 	if rt := stringFromMap(info, "refresh_token"); rt != "" && rt != refreshed.RefreshToken {
 		refreshed.RefreshToken = rt
@@ -216,12 +310,15 @@ func (c *LoginBufferClient) RefreshLoginBuffer(ctx context.Context, creds LoginB
 	}
 	lb, err := c.FetchLoginBuffer(ctx, refreshed)
 	if err != nil {
-		return LoginBufferResult{}, err
+		return LoginBufferResult{Credentials: refreshed, Refreshed: true}, err
 	}
 	return LoginBufferResult{LoginBuffer: lb, Credentials: refreshed, Refreshed: true}, nil
 }
 
 func (c *LoginBufferClient) FetchUserInfo(ctx context.Context, creds LoginBufferCredentials) (map[string]any, error) {
+	if creds.Provider == "pcmgr" {
+		return map[string]any{"nickname": creds.PCMgr.Nickname, "headimgurl": creds.PCMgr.Avatar, "unionid": creds.PCMgr.UnionID}, nil
+	}
 	ts, nonce := timestampMS(), nonce4()
 	var data map[string]any
 	err := c.requestJSON(ctx, http.MethodGet, userInfoURL, nil, map[string]string{
@@ -264,12 +361,23 @@ func (c *LoginBufferClient) requestJSON(ctx context.Context, method, url string,
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(data[:min(len(data), 200)]))
+		// Error bodies can echo the submitted access/refresh tokens. Keep the
+		// HTTP status without copying an untrusted response into logs or APIs.
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	if err = json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("decode JSON: %w: %s", err, string(data[:min(len(data), 200)]))
+		return fmt.Errorf("decode JSON: %w", err)
 	}
 	return nil
+}
+
+func redactCredentials(message string, creds LoginBufferCredentials) string {
+	for _, secret := range []string{creds.AccessToken, creds.RefreshToken, creds.OpenID} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	return message
 }
 
 type loginBufferRequest struct {
@@ -301,6 +409,13 @@ type refreshTokenUserInfo struct {
 	RefreshToken string `json:"refreshToken"`
 	AccessToken  string `json:"accessToken"`
 	LoginType    string `json:"loginType"`
+}
+
+type loginCredentialResponse struct {
+	Code     json.RawMessage `json:"code"`
+	Message  any             `json:"msg"`
+	UserInfo map[string]any  `json:"user_info"`
+	ExtInfo  map[string]any  `json:"ext_info"`
 }
 
 func timestampMS() string {
@@ -367,20 +482,18 @@ func int64FromMap(m map[string]any, key string) int64 {
 	}
 }
 
-func intFromAny(v any) int {
-	switch x := v.(type) {
-	case int:
-		return x
-	case int64:
-		return int(x)
-	case float64:
-		return int(x)
-	case json.Number:
-		n, _ := x.Int64()
-		return int(n)
-	default:
-		return 0
+func credentialResponseCode(raw json.RawMessage) (int, error) {
+	// Preserve the JSON representation: truncating a float or defaulting a
+	// missing/unrecognized value to zero would turn a rejection into success.
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return 0, fmt.Errorf("credential response code must be an integer")
 	}
+	code, err := strconv.ParseInt(number.String(), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("credential response code must be an integer")
+	}
+	return int(code), nil
 }
 
 func defaultString(s, def string) string {

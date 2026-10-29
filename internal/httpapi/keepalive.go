@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -82,7 +83,8 @@ accountsLoop:
 				if status == "expired" {
 					a.clearKeepAliveRetry(acc.ID)
 				} else {
-					a.setKeepAliveRetry(acc.ID, time.Now().Add(keepAliveRetryBackoff))
+					now := time.Now()
+					a.setKeepAliveRetry(acc.ID, now.Add(keepAliveFailureBackoff(protocol.CredentialsFromMap(acc.Credentials), now)))
 				}
 				if ctx.Err() == nil {
 					log.Printf("keepalive: account id=%d refresh failed: %v", acc.ID, err)
@@ -135,6 +137,15 @@ func (a *App) clearKeepAliveRetry(accountID int64) {
 	a.keepAliveRetryMu.Lock()
 	delete(a.keepAliveRetryAt, accountID)
 	a.keepAliveRetryMu.Unlock()
+}
+
+func keepAliveFailureBackoff(creds protocol.LoginBufferCredentials, now time.Time) time.Duration {
+	if creds.Provider == "pcmgr" {
+		return keepAliveRetryBackoff
+	}
+	// A five-minute delay would skip the entire official four-minute window.
+	remaining := time.Unix(creds.ExpiresAt, 0).Sub(now)
+	return min(keepAliveRetryBackoff, max(30*time.Second, remaining/2))
 }
 
 func keepAliveAccountTimeout(requestTimeout time.Duration) time.Duration {
@@ -209,16 +220,57 @@ func (a *App) refreshAccountWithPolicy(ctx context.Context, acc *store.WechatAcc
 			return accountStatus(latest), false, fmt.Errorf("resolve account proxy: %w", err)
 		}
 	}
-	result, err := a.refreshLoginBufferWithProxy(ctx, creds, proxyValue, fallbackDirect)
+	refreshed, err := a.refreshCredentialsWithProxy(ctx, creds, proxyValue, fallbackDirect)
 	if err != nil {
 		status := refreshFailureStatus(accountStatus(latest), creds, err, time.Now())
-		if setErr := a.setAccountStatus(ctx, latest.ID, status); setErr != nil {
+		applied, setErr := a.db.ApplyCredentialRefresh(ctx, latest, latest.LoginBuffer, latest.Credentials, status)
+		if setErr != nil {
 			err = fmt.Errorf("%v; update status: %w", err, setErr)
+		} else if !applied {
+			return "unknown", false, fmt.Errorf("account changed during refresh; result discarded: %w", err)
+		} else if status == "expired" {
+			a.invalidateProxyLease(latest.ID)
+			a.clearKeepAliveRetry(latest.ID)
 		}
 		return status, false, err
 	}
-	if err = a.db.SetAccountCredentialStatus(ctx, latest.ID, result.LoginBuffer, result.Credentials.ToMap(), "alive"); err != nil {
-		return "expired", false, err
+	// Save a rotated token before any subsequent upstream request. A cancelled
+	// browser request must not discard a refresh already accepted by the server.
+	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	applied, err := a.db.ApplyCredentialRefresh(saveCtx, latest, latest.LoginBuffer, refreshed.ToMap(), "alive")
+	if err != nil || !applied {
+		cancelSave()
+		if err == nil {
+			err = errors.New("account changed during refresh; result discarded")
+		}
+		return "unknown", false, err
+	}
+	if !force {
+		cancelSave()
+		// Official token keepalive does not obtain a new ILink login buffer.
+		// Buffer recovery happens on demand, when a protocol call needs it.
+		return "alive", true, nil
+	}
+	saved, err := a.db.GetAccount(saveCtx, latest.ID)
+	cancelSave()
+	if err != nil {
+		return "alive", true, err
+	}
+	if saved.OpenID != latest.OpenID || protocol.CredentialsFromMap(saved.Credentials) != refreshed {
+		return "unknown", true, errors.New("account changed after refresh; buffer request skipped")
+	}
+	buffer, err := a.fetchLoginBufferWithProxy(ctx, refreshed, proxyValue, fallbackDirect)
+	if err != nil {
+		return "alive", true, fmt.Errorf("credentials renewed; fetch login buffer: %w", err)
+	}
+	saveCtx, cancelSave = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelSave()
+	applied, err = a.db.ApplyCredentialRefresh(saveCtx, saved, buffer, saved.Credentials, "alive")
+	if err != nil {
+		return "alive", true, err
+	}
+	if !applied {
+		return "unknown", true, errors.New("account changed while fetching login buffer; result discarded")
 	}
 	return "alive", true, nil
 }
@@ -263,26 +315,42 @@ func definitiveCredentialFailure(err error) bool {
 	if errors.Is(err, protocol.ErrMissingRefreshToken) {
 		return true
 	}
-	var rejected *protocol.RefreshRejectedError
-	if errors.As(err, &rejected) {
+	switch rejected := err.(type) {
+	case *protocol.RefreshRejectedError:
+		return definitiveRefreshMessage(rejected.Code, rejected.Message)
+	case *protocol.LoginBufferRejectedError:
 		return definitiveRefreshMessage(rejected.Code, rejected.Message)
 	}
-	var bufferRejected *protocol.LoginBufferRejectedError
-	if errors.As(err, &bufferRejected) {
-		return definitiveRefreshMessage(bufferRejected.Code, bufferRejected.Message)
+	// A refresh rejection and its check-login fallback are separate causes.
+	// Inspect both: errors.As alone stops at the first ambiguous rejection.
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, cause := range wrapped.Unwrap() {
+			if definitiveCredentialFailure(cause) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return definitiveCredentialFailure(wrapped.Unwrap())
 	}
 	// Transport errors may contain a proxy provider's "token expired" or an
 	// HTTP/JSON error body. They are not evidence that WeChat revoked a session.
 	return false
 }
 
+var rejectedRefreshCode = regexp.MustCompile(`(?i)(?:^|(?:\berror\b|\bcode\b)\s*[:=]?\s*|\[)(?:40030|42002|42007)(?:$|[\s\]|,;])`)
+
 func definitiveRefreshMessage(code int, raw string) bool {
+	// Official check-login sometimes returns only "error 42007 | 42007"
+	// without spelling out refresh_token. These known WeChat business codes
+	// are conclusive, but only inside a typed credential rejection, never
+	// in an HTTP/proxy response or transport error.
+	if code == 40030 || code == 42002 || code == 42007 || rejectedRefreshCode.MatchString(raw) {
+		return true
+	}
 	message := strings.ToLower(strings.TrimSpace(raw))
 	message = strings.NewReplacer("_", " ", "-", " ", "refreshtoken", "refresh token").Replace(message)
 	refreshToken := strings.Contains(message, "refresh token") || strings.Contains(message, "刷新令牌")
-	if (code == 42007 || strings.Contains(message, "42007")) && refreshToken {
-		return true
-	}
 	if (code == 40188 || strings.Contains(message, "40188")) && strings.Contains(message, "invalid scope") {
 		return true
 	}
@@ -307,15 +375,15 @@ func (a *App) accountRefreshAhead(ctx context.Context, accountID int64) (time.Du
 	return time.Duration(setting.RefreshAheadSeconds) * time.Second, nil
 }
 
-func (a *App) refreshLoginBufferWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, proxyValue string, fallbackDirect bool) (protocol.LoginBufferResult, error) {
+func (a *App) refreshCredentialsWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, proxyValue string, fallbackDirect bool) (protocol.LoginBufferCredentials, error) {
 	if proxyValue == "" {
-		return a.refreshLoginBuffer(ctx, creds)
+		return a.refreshCredentials(ctx, creds)
 	}
 	client, err := qr.NewClientWithProxy(a.cfg.RequestTimeout, proxyValue, fallbackDirect)
 	if err != nil {
-		return protocol.LoginBufferResult{}, err
+		return protocol.LoginBufferCredentials{}, err
 	}
-	return client.RefreshLoginBuffer(ctx, creds)
+	return client.LoginBuffers().RefreshCredentials(ctx, creds)
 }
 
 func (a *App) fetchUserInfoWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, proxyValue string, fallbackDirect bool) (map[string]any, error) {
@@ -330,6 +398,11 @@ func (a *App) fetchUserInfoWithProxy(ctx context.Context, creds protocol.LoginBu
 }
 
 func credentialsDueForRefresh(creds protocol.LoginBufferCredentials, now time.Time, ahead time.Duration) bool {
+	if creds.Provider == "pcmgr" {
+		// This is the native key's next renewal schedule, not an OAuth expiry.
+		// Applying the OAuth lead time would repeatedly rotate short intervals.
+		return now.Unix() >= creds.PCMgr.NextRenewAt()
+	}
 	return creds.ExpiresAt <= 0 || now.Add(ahead).Unix() >= creds.ExpiresAt
 }
 

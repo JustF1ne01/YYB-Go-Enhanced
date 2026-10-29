@@ -91,22 +91,59 @@ host:port|user|pass
 
 ## 自动保活
 
+<a id="scan-first-call-409"></a>
+
+### 扫码成功后首次调用返回 409（#105 / #109）
+
+确认扫码并成功入库，只能证明取得过凭据；需要结合首次失败的实际业务码判断后续是否被上游拒绝。v0.2.40 起，协议恢复失败的 409 保留原 `code` / `msg`，增加安全诊断，例如：
+
+```json
+{
+  "code": 409,
+  "msg": "account login_buffer expired (refresh failed); re-scan required",
+  "data": {
+    "rescan_required": true,
+    "upstream_errors": [
+      {"stage": "manual_auth", "upstream_code": -10},
+      {"stage": "login_buffer", "upstream_code": -101},
+      {"stage": "check_login", "upstream_code": -109, "wechat_code": 42007}
+    ]
+  }
+}
+```
+
+这是格式示例，不代表所有 409 都是该错误链。`manual_auth` 是协议握手拒绝，`login_buffer` 是获取登录票据，`refresh_token` 是凭据刷新，`check_login` 是官方登录检查。仅返回已解析的数字业务码；不回显 token、OpenID、代理认证或原始响应。本次 `/accounts/refresh`、批量刷新和集成刷新结果遇到业务拒绝也增加 `upstream_errors`。
+
+v0.2.45 增加 `shortlink_application` / `shortlink_transport`：短连接经过 MMTLS 认证后，wpkg 头返回应用或传输拒绝码，且没有加密业务正文。实际已观察到 `shortlink_application / -14`；不能仅据这个数字解释成 OAuth 撤销。即使后续会话重建被 ManualAuth 拒绝，首次短连接码也保留在错误链；不改变既有重建次数和账号清理条件。
+
+v0.2.43 进一步保留主刷新与后续 check-login 的两段错误类型。v0.2.40–v0.2.42 这一路径可能只显示 `check_login`，不能据此认为没有执行主刷新。只有真正收到的业务拒绝才列入诊断；网络超时仍按网络异常处理，不猜测微信码。
+
+首次恢复失败还会写入默认服务日志，使用固定字段与账号数字 ID。账号已经标为失效后，再调用只返回 409 与空诊断列表，不重新请求上游；服务没有持久保存历史拒绝码，事后单独调用 `/accounts/refresh` 或手动状态接口无法还原旧原因，请保留首次 409 的诊断或对应时间的服务日志。不能从“同地区家宽”、健康接口 200 或本地剩余两小时推断凭据仍有效。
+
+普通扫码的 `/qr/{sid}/cancel` 仅移除二维码会话，不撤销已入库账号。项目未设置失效后重扫的冷却期；同一微信重扫沿用原账号记录，但上游是否接受新授权仍以真实调用结果为准。不要把缺少具体错误的 409 直接归因于代理或风控。
+
+### 默认配置
+
 默认配置：
 
 ```dotenv
-YYB_KEEPALIVE_INTERVAL=1m
-YYB_KEEPALIVE_AHEAD=45m
+YYB_KEEPALIVE_INTERVAL=2m
+YYB_KEEPALIVE_AHEAD=4m
 ```
 
 行为如下：
 
-- 每分钟执行一次轻量数据库检查，检查本身不会提取代理。
-- 直连账号在 access token 剩余不足 45 分钟时刷新。
+- 每两分钟执行一次轻量数据库检查，检查本身不会提取代理。
+- 直连账号在 access token 剩余不足 4 分钟时刷新，对齐已复核的应用宝客户端默认策略。已有环境变量、启动参数和每账号代理刷新窗口仍优先生效，升级不会偷偷覆盖自定义值。
 - 配置专属代理的账号默认在剩余不足 5 分钟时刷新，可按账号调整为 5 到 90 分钟。
 - 短效动态代理标记为不参与长期保活，避免后台反复提取 IP。
 - 将 `YYB_KEEPALIVE_INTERVAL=0` 可关闭后台保活。
 
-业务调用发现凭据接近到期时也会按需续期。网络超时、DNS、代理故障等临时错误会保留账号状态并在后续重试；只有微信明确拒绝 refresh token，或凭据已经确定失效，才标记为需要重扫并停止协议调用。
+扫码来自官方主登录 `/pc_yyb/pcyyb_oauth` 的凭据，续期使用对应的 `/pc_yyb/pcyyb_refresh_token` 和 `pc_yyb` 签名；标明 `pc_yyb_auth` 来源的独立 wxapp 授权保留 `_auth` 路径。主登录续期出现含糊的 `-109` 时，最多额外检查一次官方 check-login，以其返回的完整凭据或明确错误为准，不把 `invalid login type` 直接解释为微信已撤销账号。
+
+后台续期先保存 token，不额外获取 ILink 登录票据。实际调用需要时才取票据；取票据失败或浏览器取消请求不会丢掉已经成功轮换的 token。并发重扫、删除、整理 ID 或手动标失效后，旧刷新请求不能覆盖新账号状态。
+
+网络超时、DNS、代理故障等临时错误会保留账号状态并在后续重试；只有微信明确拒绝 refresh token，或凭据已经确定失效，才标记为需要重扫并停止协议调用。这些处理不保证上游长期接受授权。
 
 ### 约两小时后失效的排查（#96）
 
