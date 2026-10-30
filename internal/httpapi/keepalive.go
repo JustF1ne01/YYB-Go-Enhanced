@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"yyb_go/internal/eventlog"
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/qr"
 	"yyb_go/internal/store"
@@ -61,7 +62,7 @@ accountsLoop:
 		if ctx.Err() != nil {
 			break accountsLoop
 		}
-		if accountStatus(acc) == "expired" {
+		if accountStatus(acc) == "expired" || acc.SessionOnly() {
 			continue
 		}
 		if a.keepAliveShouldSkip(ctx, acc, time.Now()) {
@@ -80,7 +81,13 @@ accountsLoop:
 			defer cancel()
 			status, refreshed, err := a.refreshAccount(accountCtx, acc, false)
 			if err != nil {
+				fields := eventlog.ForAccount(acc)
+				fields.Rejections = eventRejections(err)
+				a.events.Emit("keepalive.failed", fields)
 				if status == "expired" {
+					a.events.Emit("account.expired", fields)
+				}
+				if status == "expired" || status == store.StatusSessionOnly {
 					a.clearKeepAliveRetry(acc.ID)
 				} else {
 					now := time.Now()
@@ -93,6 +100,7 @@ accountsLoop:
 			}
 			a.clearKeepAliveRetry(acc.ID)
 			if refreshed {
+				a.events.Emit("keepalive.renewed", eventlog.ForAccount(acc))
 				log.Printf("keepalive: account id=%d credentials renewed", acc.ID)
 			}
 		}(acc)
@@ -197,6 +205,9 @@ func (a *App) refreshAccountWithPolicy(ctx context.Context, acc *store.WechatAcc
 	if accountStatus(latest) == "expired" {
 		return "expired", false, nil
 	}
+	if latest.SessionOnly() {
+		return store.StatusSessionOnly, false, errors.New("authorization rejected; only the existing protocol session may be used; re-scan required")
+	}
 	if latest.Credentials == nil {
 		err = fmt.Errorf("credentials are missing")
 		if setErr := a.db.SetAccountStatus(ctx, latest.ID, "unknown"); setErr != nil {
@@ -223,13 +234,24 @@ func (a *App) refreshAccountWithPolicy(ctx context.Context, acc *store.WechatAcc
 	refreshed, err := a.refreshCredentialsWithProxy(ctx, creds, proxyValue, fallbackDirect)
 	if err != nil {
 		status := refreshFailureStatus(accountStatus(latest), creds, err, time.Now())
+		if status == "expired" {
+			// OAuth rejection does not prove the separate ILink PSK is revoked.
+			// Retain only an eligible session on the configured protocol route.
+			protocolProxy, directFallback, routeErr := a.resolveWXAppProxy(ctx, latest.ID)
+			if routeErr == nil && (a.pool.HasReusableSession(ctx, latest.ID, protocolProxy) ||
+				protocolProxy != "" && directFallback && a.pool.HasReusableSession(ctx, latest.ID, "")) {
+				status = store.StatusSessionOnly
+			}
+		}
 		applied, setErr := a.db.ApplyCredentialRefresh(ctx, latest, latest.LoginBuffer, latest.Credentials, status)
 		if setErr != nil {
 			err = fmt.Errorf("%v; update status: %w", err, setErr)
 		} else if !applied {
 			return "unknown", false, fmt.Errorf("account changed during refresh; result discarded: %w", err)
-		} else if status == "expired" {
-			a.invalidateProxyLease(latest.ID)
+		} else if status == "expired" || status == store.StatusSessionOnly {
+			if status == "expired" {
+				a.invalidateProxyLease(latest.ID)
+			}
 			a.clearKeepAliveRetry(latest.ID)
 		}
 		return status, false, err
@@ -283,6 +305,7 @@ func (a *App) setAccountStatus(ctx context.Context, accountID int64, status stri
 		return err
 	}
 	if status == "expired" {
+		a.events.Emit("account.expired", eventlog.Fields{AccountID: accountID})
 		_ = a.db.InvalidateAccountSessions(ctx, accountID)
 		a.invalidateProxyLease(accountID)
 		a.clearKeepAliveRetry(accountID)

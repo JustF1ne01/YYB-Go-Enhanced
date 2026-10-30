@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"yyb_go/internal/pcmgr"
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/store"
 )
@@ -79,6 +80,14 @@ func TestRecovery409IncludesSafeTypedDiagnostics(t *testing.T) {
 	}
 }
 
+func TestPCMgrDiagnosticsKeepTicketAndKeyRenewalDistinct(t *testing.T) {
+	err := errors.Join(&protocol.ShortlinkRejectedError{Code: -14}, &pcmgr.RPCError{Command: 20138, Code: 1}, &pcmgr.BufferRejectedError{Code: 1}, &pcmgr.RPCError{Command: 20042, Code: 2}, &pcmgr.RPCError{Command: 12345, Code: 3})
+	want := []upstreamDiagnostic{{Stage: "shortlink_application", UpstreamCode: -14}, {Stage: "pcmgr_login_buffer", UpstreamCode: 1}, {Stage: "pcmgr_key_renewal", UpstreamCode: 2}}
+	if !reflect.DeepEqual(credentialDiagnostics(err), want) {
+		t.Fatal("lost PCMgr recovery stage")
+	}
+}
+
 func TestDiagnosticsDoNotInferCodesFromTransportOrIdentifiers(t *testing.T) {
 	for _, err := range []error{
 		errors.New("proxy failed error 42007 private-token"),
@@ -103,5 +112,15 @@ func TestRefreshOutIncludesCurrentBusinessCodes(t *testing.T) {
 	want := []upstreamDiagnostic{{Stage: "refresh_token", UpstreamCode: 42002}}
 	if !reflect.DeepEqual(out["upstream_errors"], want) {
 		t.Fatal("refresh response lost typed upstream code")
+	}
+}
+
+func TestNativeDiagnosticsKeepLayerAndNeverCopyUnknownStage(t *testing.T) {
+	err := errors.Join(&protocol.ShortlinkRejectedError{Code: -14},
+		&protocol.AutoAuthRejectedError{Stage: "business", Code: -13},
+		&protocol.AutoAuthRejectedError{Stage: "private-identifier", Code: 1})
+	want := []upstreamDiagnostic{{Stage: "shortlink_application", UpstreamCode: -14}, {Stage: "native_autoauth_business", UpstreamCode: -13}}
+	if !reflect.DeepEqual(credentialDiagnostics(err), want) {
+		t.Fatal("native diagnostic lost layer or exposed arbitrary stage")
 	}
 }

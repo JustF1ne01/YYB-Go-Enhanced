@@ -12,12 +12,15 @@ import (
 	"sync"
 	"time"
 
+	"yyb_go/internal/eventlog"
 	"yyb_go/internal/store"
 )
 
 // ErrLoginCodeUnavailable describes a decrypted application response without a
 // wx.login code. It does not establish that the account's session expired.
 var ErrLoginCodeUnavailable = errors.New("wx.login returned no code; check the application's AppID or authorization")
+
+var ErrCachedSessionUnavailable = errors.New("authorization rejected and no reusable protocol session; re-scan required")
 
 type Config struct {
 	ShortlinkTimeout        time.Duration
@@ -41,27 +44,36 @@ func DefaultConfig() Config {
 
 type WmpfSession struct {
 	Session          AppSession
+	AutoAuth         autoAuthState
 	PSK              pskEntry
 	ShortlinkTargets []Target
 	CreatedAt        time.Time
 	TCPProxy         string
 	FallbackDirect   bool
+	CachedOnly       bool
+	recoveryRow      *store.SessionRow
+	nativePersisted  bool
 }
 
 type Pool struct {
-	cfg Config
-	db  *store.DB
+	events *eventlog.Logger
+	cfg    Config
+	db     *store.DB
 
 	mu    sync.Mutex
 	locks map[string]chan struct{}
 	// codeLocks serialize wx.login requests for one account. Different
 	// accounts keep running concurrently, while a single account cannot have
 	// two one-time login codes consumed at the same time.
-	codeLocks map[int64]chan struct{}
+	codeLocks   map[int64]chan struct{}
+	codeRepairs map[string]codeRepairAttempt
 
 	loginSem     chan struct{}
 	shortlinkSem chan struct{}
 }
+
+// SetEventLogger is called once before serving requests or starting workers.
+func (p *Pool) SetEventLogger(events *eventlog.Logger) { p.events = events }
 
 func NewPool(cfg Config, db *store.DB) *Pool {
 	def := DefaultConfig()
@@ -88,6 +100,7 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 		db:           db,
 		locks:        map[string]chan struct{}{},
 		codeLocks:    map[int64]chan struct{}{},
+		codeRepairs:  map[string]codeRepairAttempt{},
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
 	}
@@ -105,20 +118,10 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 
 func (p *Pool) getCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
 	call := func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		hostAppID := st.Session.HostAppID
-		if len(hostAppID) == 0 {
-			hostAppID = hostAppIDDefault
-		}
-		plain := buildJSAPIPlaintext(st.Session.UIN, appID, jsLoginURL, jsLoginCmdID, nil, hostAppID, nil)
-		envelope, err := buildTransferPacket(st.Session, plain)
-		if err != nil {
-			return nil, err
-		}
-		code, _, err := p.sendEnvelope(ctx, st, envelope)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
+		return p.requestLoginCode(ctx, st, appID)
+	}
+	if len(expected) > 0 && expected[0].SessionOnly() && !p.hasNativeRecovery(ctx, accountID, tcpProxy) {
+		return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call, expected...)
 	}
 	return retryLoginCode(ctx, func() (map[string]any, error) {
 		return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call, expected...)
@@ -203,6 +206,27 @@ func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string)
 }
 
 func (p *Pool) invalidateExpected(ctx context.Context, accountID int64, proxy string, expected ...*store.WechatAccount) error {
+	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, proxy))
+	if err := acquire(ctx, lock); err != nil {
+		return err
+	}
+	defer release(lock)
+	acc, err := p.db.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if len(expected) > 0 && !acc.SameAuthorization(expected[0]) {
+		return store.ErrAccountAuthorizationChanged
+	}
+	if saved, err := p.nativeRecoveryState(ctx, accountID, proxy); err == nil {
+		// A stale PSK must not erase its independent rotating AutoKey.
+		saved.PSK.ExpiredAt = time.Now().Add(-time.Second).Unix()
+		_, err = p.db.ReplaceNativeSessionForAccount(ctx, acc, saved.recoveryRow, saved.Session.UIN, saved.toBlob(), saved.PSK.ExpiredAt)
+		return err
+	}
+	if acc.SessionOnly() {
+		return ErrCachedSessionUnavailable
+	}
 	if len(expected) > 0 {
 		return p.db.InvalidateSessionForAccount(ctx, expected[0], proxy)
 	}
@@ -214,10 +238,14 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	if err == nil {
 		st.FallbackDirect = fallbackDirect
 		res, err := op(ctx, st)
-		if err == nil || tcpProxy == "" || !fallbackDirect {
+		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || st.CachedOnly {
 			return res, err
 		}
 		_ = p.invalidateExpected(ctx, accountID, tcpProxy, expected...)
+	}
+	var recovery *CodeSessionRecoveryError
+	if errors.As(err, &recovery) {
+		return nil, err
 	}
 	if tcpProxy != "" && fallbackDirect {
 		st, err = p.state(ctx, loginBuffer, accountID, "", false, expected...)
@@ -241,7 +269,10 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 		return WmpfSession{}, store.ErrAccountAuthorizationChanged
 	}
 	if st, err := p.cachedSession(ctx, accountID, tcpProxy); err == nil {
+		st.CachedOnly = acc.SessionOnly()
 		return st, nil
+	} else if acc.SessionOnly() && !p.hasNativeRecovery(ctx, accountID, tcpProxy) {
+		return WmpfSession{}, ErrCachedSessionUnavailable
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
 	}
@@ -250,7 +281,15 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 		return WmpfSession{}, err
 	}
 	defer release(lock)
+	acc, err = p.db.GetAccount(ctx, accountID)
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	if len(expected) > 0 && !acc.SameAuthorization(expected[0]) {
+		return WmpfSession{}, store.ErrAccountAuthorizationChanged
+	}
 	if st, err := p.cachedSession(ctx, accountID, tcpProxy); err == nil {
+		st.CachedOnly = acc.SessionOnly()
 		return st, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
@@ -261,6 +300,17 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	}
 	if len(expected) > 0 && !acc.SameAuthorization(expected[0]) {
 		return WmpfSession{}, store.ErrAccountAuthorizationChanged
+	}
+	if saved, err := p.nativeRecoveryState(ctx, accountID, tcpProxy); err == nil {
+		restored, restoreErr := p.restoreNativeSession(ctx, acc, saved)
+		if restoreErr != nil {
+			return WmpfSession{}, &CodeSessionRecoveryError{Cause: restoreErr}
+		}
+		restored.CachedOnly = acc.SessionOnly()
+		return restored, nil
+	}
+	if acc.SessionOnly() {
+		return WmpfSession{}, ErrCachedSessionUnavailable
 	}
 	if err = acquire(ctx, p.loginSem); err != nil {
 		return WmpfSession{}, err
@@ -307,6 +357,17 @@ func (p *Pool) cachedSession(ctx context.Context, accountID int64, tcpProxy stri
 		}
 	}
 	return st, nil
+}
+
+// This checks local eligibility only; it does not assert server acceptance.
+func (p *Pool) HasReusableSession(ctx context.Context, accountID int64, tcpProxy string) bool {
+	st, err := p.cachedSession(ctx, accountID, tcpProxy)
+	if err != nil || st.PSK.PSKType != 1 || st.PSK.ExpiredAt <= time.Now().Unix() {
+		return p.hasNativeRecovery(ctx, accountID, tcpProxy)
+	}
+	key, keyErr := hex.DecodeString(st.PSK.PreSharedKey)
+	ticket, ticketErr := hex.DecodeString(st.PSK.TicketEntry)
+	return keyErr == nil && len(key) > 0 && ticketErr == nil && len(ticket) > 0
 }
 
 func (p *Pool) lockFor(key string) chan struct{} {
@@ -426,6 +487,7 @@ func (p *Pool) loginTarget(ctx context.Context, target Target, loginBuffer, tcpP
 	}
 	appSess.DeviceID = meta.DeviceID
 	appSess.HostAppID = meta.HostAppID
+	autoAuth := autoAuthFromResponse(safeBytes(pbParse(mar)[3]), appDeviceID)
 	psks, err := mc.extractPSKs()
 	if err != nil {
 		return WmpfSession{}, err
@@ -435,7 +497,7 @@ func (p *Pool) loginTarget(ctx context.Context, target Target, loginBuffer, tcpP
 		return WmpfSession{}, fmt.Errorf("login finished but no access PSK was issued")
 	}
 	return WmpfSession{
-		Session: appSess, PSK: psk, CreatedAt: time.Now(),
+		Session: appSess, AutoAuth: autoAuth, PSK: psk, CreatedAt: time.Now(),
 		TCPProxy: tcpProxy, FallbackDirect: fallbackDirect,
 	}, nil
 }
@@ -484,7 +546,11 @@ func (st WmpfSession) toBlob() map[string]any {
 			"device_id":  encBytes(st.Session.DeviceID),
 			"host_appid": encBytes(st.Session.HostAppID),
 		},
-		"psk_entry":         st.PSK,
+		"psk_entry": st.PSK,
+		"native_autoauth": map[string]any{
+			"device": encBytes(st.AutoAuth.Device), "key": encBytes(st.AutoAuth.Key),
+			"enc_key": encBytes(st.AutoAuth.EncKey), "attempted_at": st.AutoAuth.AttemptedAt,
+		},
 		"shortlink_targets": targetsToAny(st.ShortlinkTargets),
 		"tcp_proxy":         st.TCPProxy,
 	}
@@ -519,6 +585,10 @@ func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
 		ShortlinkTargets: targetsFromAny(blob["shortlink_targets"]),
 		TCPProxy:         stringAny(blob["tcp_proxy"]),
 		CreatedAt:        time.Now(),
+	}
+	if am, ok := blob["native_autoauth"].(map[string]any); ok {
+		st.AutoAuth = autoAuthState{Device: decBytes(am["device"]), Key: decBytes(am["key"]),
+			EncKey: decBytes(am["enc_key"]), AttemptedAt: int64FromAny(am["attempted_at"])}
 	}
 	if len(st.ShortlinkTargets) == 0 {
 		st.ShortlinkTargets = append([]Target(nil), shortlinkFallbackTargets...)

@@ -1,6 +1,7 @@
 (() => {
   const pages = {
     "/maintenance": ["系统维护", "版本更新与重启"],
+    "/logs": ["运行日志", "服务事件与授权诊断"],
     "/": ["我的控制台", "账号与能力调用"],
     "/scan": ["添加账号", "微信授权"],
     "/proxies": ["代理设置", "账号网络出口"],
@@ -47,6 +48,7 @@
       ["/account-links", "link", "已激活短链接", true, true],
       ["/users", "users", "用户管理", false, true],
       ["/maintenance", "settings", "系统维护", false, true],
+      ["/logs", "logs", "运行日志", false, true],
       ["/settings", "settings", "个人设置", true, false]
     ]}
   ];
@@ -104,6 +106,36 @@
     sidebar.inert = mobileNav.matches;
     if (restore && mobileNav.matches) menu.focus();
   };
+  // These navigation entries are views of the same workspace. Reloading the
+  // document silently resets the account, target AppID and pending request.
+  const focusWorkspace = () => {
+    if (location.pathname !== "/") return;
+    const focus = new URLSearchParams(location.search).get("focus");
+    const context = {accounts:["我的微信账号", "账号与有效期"], test:["接口测试", "协议能力调用"]}[focus] || pages["/"];
+    shell.querySelector(".platform-page-title").textContent = context[0];
+    shell.querySelector(".platform-breadcrumb").textContent = `YYB Go / ${context[1]}`;
+    shell.querySelectorAll(".platform-nav a").forEach(link => {
+      if (isActive(link.getAttribute("href"))) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+    const target = focus === "accounts" ? document.getElementById("accountWorkspace")
+      : focus === "test" ? document.getElementById("callWorkspace") : main;
+    target?.scrollIntoView({block:"start"});
+  };
+  sidebar.addEventListener("click", event => {
+    const link = event.target.closest("a");
+    if (!link || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey
+      || link.target || link.hasAttribute("download") || location.pathname !== "/") return;
+    const target = new URL(link.href);
+    if (target.origin !== location.origin || target.pathname !== "/") return;
+    const ref = new URLSearchParams(location.search).get("ref");
+    if (ref) target.searchParams.set("ref", ref);
+    event.preventDefault();
+    if (target.href !== location.href) history.pushState(null, "", target.pathname + target.search + target.hash);
+    closeNav();
+    focusWorkspace();
+  });
+  window.addEventListener("popstate", focusWorkspace);
   menu.onclick = () => {
     if (document.body.classList.contains("platform-nav-open")) return closeNav();
     document.body.classList.add("platform-nav-open");
